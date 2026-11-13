@@ -12,7 +12,9 @@ Output: <folder>/composed_patterns/
           previews/<...>_preview_3k.png            same as PNG (needs resvg-py)
           report.csv
 
-Layouts:  grid, halfdrop, brick, scatter (tossed motifs, random rotation)
+Layouts:  grid, halfdrop, brick, scatter (tossed motifs, random rotation),
+          auto (hero / medium / filler motifs placed by their real silhouettes,
+          many candidates scored, the best ones kept - see --layouts auto)
 Palettes: original colours + built-in palettes; colours are remapped by
           lightness, so the light/dark structure of the motifs is kept.
 
@@ -26,6 +28,11 @@ Usage:
     python PatternComposer.py D:\\motifs\\nordic_flora
     python PatternComposer.py D:\\motifs\\nordic_flora --layouts scatter --variants 3
     python PatternComposer.py D:\\motifs\\nordic_flora --palettes original,sage,noir
+    python PatternComposer.py D:\\motifs\\cranes --layouts auto --palettes original
+
+Auto layout roles: put motifs into subfolders named hero / medium / filler
+(also main, secondary, small...). Without them the most detailed motifs become
+heroes and the simplest ones fillers. Subfolders are read recursively.
 """
 
 import argparse
@@ -61,7 +68,8 @@ SCATTER_SIZE_JITTER = (0.8, 1.2)
 SCATTER_SPACING = 1.0       # 1.0 = bounding circles just touch
 PREVIEW_TILE_SIZE = 1024    # px per tile in previews
 PREVIEW_REPEATS = 3
-LAYOUTS = ('grid', 'halfdrop', 'brick', 'scatter')
+LAYOUTS = ('grid', 'halfdrop', 'brick', 'scatter', 'auto')
+DEFAULT_LAYOUTS = ('grid', 'halfdrop', 'brick', 'scatter')
 MOTIFS_PER_PATTERN = 6     # a big folder is split into sets of this size
 
 PALETTES = {
@@ -87,7 +95,7 @@ DEF_TAGS = {'linearGradient', 'radialGradient', 'clipPath', 'mask', 'pattern',
             'filter', 'symbol', 'marker'}
 SKIP_TAGS = {'title', 'desc', 'metadata', 'namedview', 'style', 'script'}
 REPORT_FIELDS = ['file', 'set', 'motif_files', 'layout', 'palette', 'motifs', 'instances',
-                 'edge_copies', 'svg_kb', 'preview_png', 'note']
+                 'edge_copies', 'svg_kb', 'preview_png', 'score', 'note']
 
 
 # --------------------------------------------------------------------------
@@ -714,6 +722,233 @@ def render_png(svg_text, path):
 
 
 # --------------------------------------------------------------------------
+# Auto layout: hero -> medium -> filler on a wrapped tile, scored, best kept
+# --------------------------------------------------------------------------
+ROLE_NAMES = {'hero': 'hero', 'main': 'hero', 'large': 'hero', 'big': 'hero',
+              'medium': 'medium', 'secondary': 'medium', 'mid': 'medium',
+              'filler': 'filler', 'fillers': 'filler', 'small': 'filler', 'accent': 'filler'}
+HERO_SIZE = (0.30, 0.40)        # longest side as share of tile width
+MEDIUM_SIZE = (0.15, 0.23)
+MOTIF_GAP = 0.012               # free space around every motif, share of tile
+MASK_BASE = 256                 # px, silhouette render size per motif
+SCORE_CELLS = 8                 # cells per side for density / tone checks
+UPRIGHT_WORDS = ('crane', 'heron', 'pine', 'tree', 'bottle', 'standing', 'snowman',
+                 'owl', 'bear', 'house', 'vase', 'cup', 'mug', 'stem', 'grass', 'cattail')
+OUTPUT_DIRS = {'composed_patterns', 'layout_brief'}
+
+_silhouettes = {}
+
+
+def assign_roles(motifs, root):
+    """Role from the parent folder name (hero/medium/filler...), else by detail.
+
+    Without role folders the most detailed third of the motifs become heroes,
+    the simplest third fillers - detailed motifs carry a pattern, simple ones
+    fill it.
+    """
+    for motif in motifs:
+        parent = motif.path.parent
+        motif.role = ROLE_NAMES.get(parent.name.lower()) if parent != root else None
+    unassigned = [m for m in motifs if not m.role]
+    if unassigned:
+        ranked = sorted(unassigned, key=lambda m: -len(m.body_markup))
+        n = len(ranked)
+        n_hero = max(1, round(n * 0.3))
+        n_filler = round(n * 0.3) if n >= 4 else 0
+        for i, motif in enumerate(ranked):
+            motif.role = 'hero' if i < n_hero else 'filler' if i >= n - n_filler else 'medium'
+    if not any(m.role == 'hero' for m in motifs):
+        max(motifs, key=lambda m: len(m.body_markup)).role = 'hero'
+
+
+def rotation_range(motif, args):
+    name = motif.name.lower()
+    if any(word in name for word in args.upright_words):
+        return args.upright_rotation
+    return args.rotation
+
+
+def motif_silhouette(motif):
+    """Alpha mask (PIL 'L') of the motif alone, longest side MASK_BASE px."""
+    if motif.index in _silhouettes:
+        return _silhouettes[motif.index]
+    from PIL import Image
+    x0, y0, x1, y1 = motif.bbox
+    w, h = max(motif.width, 1e-6), max(motif.height, 1e-6)
+    k = MASK_BASE / max(w, h)
+    svg = (f'<svg xmlns="{SVG_NS}" xmlns:xlink="{XLINK_NS}" width="{max(1, round(w * k))}" '
+           f'height="{max(1, round(h * k))}" viewBox="{x0:g} {y0:g} {w:g} {h:g}">'
+           f'<defs>{motif.defs_markup}</defs>{motif.body_markup}</svg>')
+    image = render_rgba(svg)
+    mask = image.getchannel('A') if image is not None else None
+    _silhouettes[motif.index] = mask
+    return mask
+
+
+def instance_mask(motif, size_px, angle, flip, gap_px):
+    """Boolean footprint of one placed motif (same geometry as instance_matrix)."""
+    import numpy as np
+    from PIL import Image, ImageOps
+    from scipy.ndimage import binary_dilation
+    image = motif_silhouette(motif)
+    if flip < 0:
+        image = ImageOps.mirror(image)
+    s = size_px / max(image.size)
+    image = image.resize((max(1, round(image.width * s)), max(1, round(image.height * s))),
+                         Image.BILINEAR)
+    image = image.rotate(-angle, resample=Image.BILINEAR, expand=True)  # SVG y points down
+    mask = np.asarray(image) > 100
+    if gap_px > 0:
+        mask = binary_dilation(mask, iterations=int(gap_px))
+    return mask
+
+
+def torus_index(mask, cx, cy, size):
+    import numpy as np
+    h, w = mask.shape
+    ys = (np.arange(h) + int(round(cy - h / 2))) % size
+    xs = (np.arange(w) + int(round(cx - w / 2))) % size
+    return np.ix_(ys, xs)
+
+
+def torus_free_distance(covered):
+    """Distance (px) from every pixel to the nearest covered pixel, wrap-aware."""
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+    h, w = covered.shape
+    if not covered.any():
+        return np.full(covered.shape, float(max(h, w)))
+    return distance_transform_edt(~np.tile(covered, (3, 3)))[h:2 * h, w:2 * w]
+
+
+def auto_layout(motifs, tile, args, rng):
+    """Big motifs first, spread out; medium ones into the biggest holes; then fillers."""
+    import numpy as np
+    size = GAP_MASK_SIZE
+    k = size / tile
+    gap_px = max(1, round(MOTIF_GAP * size))
+    covered = np.zeros((size, size), bool)
+    placements, usage = [], {m.index: 0 for m in motifs}
+    heroes = [m for m in motifs if m.role == 'hero']
+    mediums = [m for m in motifs if m.role == 'medium'] or heroes
+    fillers = [m for m in motifs if m.role == 'filler']
+
+    def pick_motif(pool, x, y):
+        near = {p[0].index for p in placements
+                if torus_distance((x, y), (p[1], p[2]), tile) < 0.25 * tile}
+        return min(pool, key=lambda m: (m.index in near, usage[m.index], rng.random()))
+
+    def place(pool, size_range, hole_limited):
+        distance = torus_free_distance(covered)
+        best = distance.max()
+        if best < gap_px * 2:
+            return False
+        ys, xs = np.nonzero(distance >= best * 0.75)       # among the biggest holes
+        i = rng.randrange(len(ys))
+        cy, cx = ys[i], xs[i]
+        motif = pick_motif(pool, cx / k, cy / k)
+        share = rng.uniform(*size_range)
+        if hole_limited:   # a motif rarely fills its box: allow ~1.3x the hole
+            share = min(share, 2.6 * distance[cy, cx] / size)
+        r = rotation_range(motif, args)
+        for _ in range(6):
+            angle = rng.uniform(-r / 2, r / 2) if r else 0.0
+            flip = rng.choice((1, -1))
+            mask = instance_mask(motif, share * size, angle, flip, gap_px)
+            index = torus_index(mask, cx, cy, size)
+            if mask.shape[0] < size and mask.shape[1] < size and not (covered[index] & mask).any():
+                covered[index] = covered[index] | mask
+                placements.append((motif, cx / k, cy / k, share * tile / max(motif.width, motif.height),
+                                   angle, flip))
+                usage[motif.index] += 1
+                return True
+            share *= 0.88
+            if share < size_range[0] * 0.6:
+                break
+        covered[max(0, cy - 2):cy + 3, max(0, cx - 2):cx + 3] = True   # skip this spot
+        return False
+
+    for _ in range(args.hero_count):
+        place(heroes, HERO_SIZE, hole_limited=bool(placements))
+    misses = 0
+    while covered.mean() < args.density and misses < 25:
+        misses = 0 if place(mediums, MEDIUM_SIZE, hole_limited=True) else misses + 1
+    note = ''
+    if fillers:
+        filler_specs = [{'motif': m, 'max': args.filler_max, 'layer': 2,
+                         'min_size': FILLER_MIN_SIZE, 'max_size': FILLER_MAX_SIZE,
+                         'rotation': rotation_range(m, args) / 2} for m in fillers]
+        placements, _, note = fill_gaps(placements, tile, filler_specs, rng)
+    return placements, note
+
+
+def score_layout(placements, tile):
+    """Lower is better. Even density, no big holes, no stripes, no twins, even tone."""
+    import numpy as np
+    instances, _ = with_edge_copies(placements, tile)
+    used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
+    size = GAP_MASK_SIZE
+    svg = build_tile_svg(instances, used, {}, 'none', tile, 'score')
+    svg = re.sub(r'width="[^"]*" height="[^"]*"', f'width="{size}" height="{size}"', svg, count=1)
+    image = render_rgba(svg)
+    if image is None:
+        return None
+    rgba = np.asarray(image).astype(float) / 255
+    covered = rgba[..., 3] > 0.1
+    c = SCORE_CELLS
+    cells = covered.reshape(c, size // c, c, size // c).mean(axis=(1, 3))
+    density = cells.std() / max(cells.mean(), 1e-6)
+    hole = torus_free_distance(covered).max() / size
+    # Ink tone per cell: dark/saturated motif pixels should be spread evenly too.
+    lum = rgba[..., :3] @ np.array([0.299, 0.587, 0.114])
+    ink = rgba[..., 3] * (1 - lum)
+    ink_cells = ink.reshape(c, size // c, c, size // c).mean(axis=(1, 3))
+    tone = ink_cells.std() / max(ink_cells.mean(), 1e-6)
+    # Stripes: coverage profiles along rows, columns and both diagonals.
+    win = max(1, size // 16)
+    kernel = np.ones(win) / win
+
+    def profile_spread(profile):
+        smooth = np.convolve(np.concatenate([profile[-win:], profile, profile[:win]]),
+                             kernel, mode='same')[win:-win]
+        return smooth.std() / max(smooth.mean(), 1e-6)
+
+    rows = np.arange(size)
+    diag1 = np.array([np.roll(covered[i], -i) for i in rows]).mean(axis=0)
+    diag2 = np.array([np.roll(covered[i], i) for i in rows]).mean(axis=0)
+    stripes = max(profile_spread(p) for p in (covered.mean(1), covered.mean(0), diag1, diag2))
+    twins = sum(1 for i, a in enumerate(placements) for b in placements[i + 1:]
+                if a[0].index == b[0].index
+                and torus_distance((a[1], a[2]), (b[1], b[2]), tile) < 0.22 * tile)
+    total = density + 4 * hole + 1.5 * stripes + 0.6 * tone + 0.15 * twins
+    return {'score': round(total, 3), 'density': round(density, 3), 'hole': round(hole, 3),
+            'stripes': round(stripes, 3), 'tone': round(tone, 3), 'twins': twins,
+            'coverage': round(float(covered.mean()), 3)}
+
+
+def contact_sheet(tiles, path, cell=360, columns=4):
+    """Each kept tile as a 2x2 repeat with its rank and score."""
+    from PIL import Image, ImageDraw
+    rows = math.ceil(len(tiles) / columns)
+    sheet = Image.new('RGB', (columns * cell, rows * (cell + 26)), 'white')
+    draw = ImageDraw.Draw(sheet)
+    for i, (label, tile_svg) in enumerate(tiles):
+        half = cell // 2
+        svg = re.sub(r'width="[^"]*" height="[^"]*"', f'width="{half}" height="{half}"',
+                     tile_svg, count=1)
+        image = render_rgba(svg)
+        if image is None:
+            return False
+        x, y = (i % columns) * cell, (i // columns) * (cell + 26)
+        for dx in (0, half):
+            for dy in (0, half):
+                sheet.paste(image.convert('RGB'), (x + dx, y + 26 + dy))
+        draw.text((x + 6, y + 6), label, fill='black')
+    sheet.save(path)
+    return True
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 def ensure_dir(path):
@@ -1018,12 +1253,85 @@ def build_from_plans(plan_path, motifs, args, out_dir):
     return rows
 
 
+def run_auto(motifs, folder, requested_palettes, args):
+    """Auto layout: try many arrangements, keep the best-scored ones."""
+    try:
+        import numpy  # noqa: F401
+        import scipy  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        print('Auto layout needs numpy, scipy and pillow: pip install numpy scipy pillow')
+        return
+    if render_rgba('<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>') is None:
+        print('Auto layout needs resvg-py: pip install resvg-py')
+        return
+    assign_roles(motifs, folder)
+    for role in ('hero', 'medium', 'filler'):
+        names = ', '.join(m.name for m in motifs if m.role == role) or '-'
+        print(f'  {role}: {names}')
+    tile = TILE_SIZE
+    collection = safe_name(folder.name)
+    out_dir = folder / 'composed_patterns' / 'auto'
+    swatch_dir, preview_dir = out_dir / 'swatch', out_dir / 'previews'
+    for directory in (out_dir, swatch_dir, preview_dir):
+        ensure_dir(directory)
+
+    print(f'Auto: trying {args.candidates} layouts...')
+    scored = []
+    for n in range(args.candidates):
+        seed = args.seed * 100003 + n
+        placements, note = auto_layout(motifs, tile, args, random.Random(seed))
+        result = score_layout(placements, tile)
+        scored.append((result['score'], seed, placements, result, note))
+        print(f'  layout {n + 1:>3}/{args.candidates}: score {result["score"]:.3f} '
+              f'({len(placements)} motifs, coverage {result["coverage"]:.2f})')
+    scored.sort(key=lambda item: item[0])
+    kept = scored[:max(1, args.keep)]
+
+    palettes = choose_palettes(requested_palettes, motifs, args.background)
+    rows, sheets, log = [], {}, []
+    for rank, (score, seed, placements, result, note) in enumerate(kept, start=1):
+        instances, copies = with_edge_copies(placements, tile)
+        used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
+        log.append({'rank': rank, 'seed': seed, **result,
+                    'motifs': sorted({p[0].name for p in placements})})
+        for palette_name, background, mapping in palettes:
+            name = f'{collection}_auto_r{rank:02d}_{palette_name}'
+            tile_svg = build_tile_svg(instances, used, mapping, background, tile, name)
+            (out_dir / f'{name}.svg').write_text(tile_svg, encoding='utf-8')
+            (swatch_dir / f'{name}_swatch.svg').write_text(
+                build_swatch_svg(instances, used, mapping, background, tile, name),
+                encoding='utf-8')
+            preview_svg = build_preview_svg(tile_svg, tile)
+            (preview_dir / f'{name}_preview_3x3.svg').write_text(preview_svg, encoding='utf-8')
+            png = False if args.no_render else render_png(
+                preview_svg, preview_dir / f'{name}_preview_3k.png')
+            sheets.setdefault(palette_name, []).append((f'#{rank}  score {score:.2f}', tile_svg))
+            rows.append({'file': f'{name}.svg', 'set': 'auto',
+                         'motif_files': ' '.join(m.name for m in used), 'layout': 'auto',
+                         'palette': palette_name, 'motifs': len(used),
+                         'instances': len(placements), 'edge_copies': copies,
+                         'svg_kb': f'{len(tile_svg.encode("utf-8")) / 1024:.0f}',
+                         'preview_png': png, 'score': score, 'note': note})
+            print(f'  #{rank} {name}.svg  score {score:.3f}')
+    for palette_name, tiles in sheets.items():
+        contact_sheet(tiles, out_dir / f'{collection}_auto_{palette_name}_contact_sheet.png')
+    import json
+    (out_dir / 'auto_layouts.json').write_text(json.dumps(log, indent=1), encoding='utf-8')
+    with open(out_dir / 'report.csv', 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Auto done: {len(kept)} best layouts in {out_dir} (see *_contact_sheet.png)')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Compose seamless vector patterns from a folder of SVG motifs.')
     parser.add_argument('input_folder', nargs='+', help='Folder with SVG motifs.')
-    parser.add_argument('--layouts', default=','.join(LAYOUTS),
-                        help='Comma list: grid, halfdrop, brick, scatter (default: all).')
+    parser.add_argument('--layouts', default=','.join(DEFAULT_LAYOUTS),
+                        help='Comma list: grid, halfdrop, brick, scatter, auto '
+                             '(default: all except auto).')
     parser.add_argument('--palettes', default=','.join(DEFAULT_PALETTES),
                         help='Comma list: original, ' + ', '.join(PALETTES) + '.')
     parser.add_argument('--variants', type=int, default=1,
@@ -1059,6 +1367,21 @@ def main():
     parser.add_argument('--plan', default=None,
                         help='JSON plan from the AI (file, or folder of .json files); '
                              'builds the patterns it describes.')
+    parser.add_argument('--candidates', type=int, default=40,
+                        help='Auto: layouts tried per palette set (default 40).')
+    parser.add_argument('--keep', type=int, default=8,
+                        help='Auto: best layouts saved (default 8).')
+    parser.add_argument('--hero_count', type=int, default=3,
+                        help='Auto: big hero motifs per tile (default 3).')
+    parser.add_argument('--density', type=float, default=0.42,
+                        help='Auto: tile share covered by hero + medium motifs before '
+                             'fillers (default 0.42).')
+    parser.add_argument('--filler_max', type=int, default=8,
+                        help='Auto: max copies of each filler motif per tile (default 8).')
+    parser.add_argument('--upright', default=','.join(UPRIGHT_WORDS),
+                        help='Auto: name words of motifs that must stay upright.')
+    parser.add_argument('--upright_rotation', type=float, default=24,
+                        help='Auto: rotation range in degrees for upright motifs (default 24).')
     parser.add_argument('--seed', type=int, default=1, help='Random seed.')
     parser.add_argument('--no_render', action='store_true', help='Skip PNG previews.')
     args = parser.parse_args()
@@ -1066,7 +1389,8 @@ def main():
     folder = Path(' '.join(args.input_folder).strip().strip('"\''))
     if not folder.is_dir():
         raise FileNotFoundError(f'Input folder not found: {folder}')
-    paths = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == '.svg')
+    paths = sorted(p for p in folder.rglob('*.svg')
+                   if p.is_file() and not OUTPUT_DIRS & set(p.relative_to(folder).parts))
     if not paths:
         print(f'No SVG motifs found in {folder}.')
         return
@@ -1075,6 +1399,7 @@ def main():
     for path in paths:
         try:
             motif = load_motif(path, len(motifs), args.keep_motif_bg)
+            motif.path = path
             motifs.append(motif)
             print(f'  motif {path.name}: {len(motif.colors)} colours, '
                   f'{motif.width:.0f}x{motif.height:.0f}')
@@ -1108,6 +1433,12 @@ def main():
 
     layouts = [l.strip() for l in args.layouts.split(',') if l.strip() in LAYOUTS]
     requested_palettes = [p.strip() for p in args.palettes.split(',') if p.strip()]
+    args.upright_words = [w.strip().lower() for w in args.upright.split(',') if w.strip()]
+    if 'auto' in layouts:
+        layouts.remove('auto')
+        run_auto(motifs, folder, requested_palettes, args)
+        if not layouts:
+            return
     motif_sets = make_sets(motifs, args.per_pattern, args.sets, random.Random(args.seed))
     collection = safe_name(folder.name)
     out_dir = folder / 'composed_patterns'
