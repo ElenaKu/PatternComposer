@@ -10,7 +10,8 @@ Usage:
     python pattern_ui.py
     python pattern_ui.py D:\\motifs\\cranes          (folder preloaded)
 
-Then open http://127.0.0.1:8765 (opens automatically).
+Then open http://127.0.0.1:8769 (opens automatically).
+Another port: python pattern_ui.py --port 8770
 Needs the same packages as the auto layout: numpy scipy pillow resvg-py
 """
 
@@ -25,7 +26,7 @@ from types import SimpleNamespace
 
 import PatternComposer as pc
 
-HOST, PORT = '127.0.0.1', 8765
+HOST, PORT = '127.0.0.1', 8769
 
 STATE = {'folder': None, 'motifs': [], 'layouts': {}}
 LOCK = threading.Lock()
@@ -433,10 +434,15 @@ if($('folder').value) load();
 
 
 def main():
-    if len(sys.argv) > 1:
-        STATE['preload'] = ' '.join(sys.argv[1:]).strip().strip('"\'')
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    url = f'http://{HOST}:{PORT}'
+    argv, port = sys.argv[1:], PORT
+    if '--port' in argv:
+        i = argv.index('--port')
+        port = int(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
+    if argv:
+        STATE['preload'] = ' '.join(argv).strip().strip('"\'')
+    server = ThreadingHTTPServer((HOST, port), Handler)
+    url = f'http://{HOST}:{port}'
     print(f'Pattern UI running at {url}  (Ctrl+C to stop)')
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
