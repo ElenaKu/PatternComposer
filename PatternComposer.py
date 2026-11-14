@@ -763,7 +763,10 @@ def assign_roles(motifs, root):
 
 def rotation_range(motif, args):
     name = motif.name.lower()
-    if any(word in name for word in args.upright_words):
+    upright = getattr(motif, 'upright', None)
+    if upright is None:
+        upright = any(word in name for word in args.upright_words)
+    if upright:
         return args.upright_rotation
     return args.rotation
 
@@ -826,7 +829,9 @@ def auto_layout(motifs, tile, args, rng):
     import numpy as np
     size = GAP_MASK_SIZE
     k = size / tile
-    gap_px = max(1, round(MOTIF_GAP * size))
+    gap_px = max(1, round(getattr(args, 'gap', MOTIF_GAP) * size))
+    hero_size = getattr(args, 'hero_size', HERO_SIZE)
+    medium_size = getattr(args, 'medium_size', MEDIUM_SIZE)
     covered = np.zeros((size, size), bool)
     placements, usage = [], {m.index: 0 for m in motifs}
     heroes = [m for m in motifs if m.role == 'hero']
@@ -869,14 +874,15 @@ def auto_layout(motifs, tile, args, rng):
         return False
 
     for _ in range(args.hero_count):
-        place(heroes, HERO_SIZE, hole_limited=bool(placements))
+        place(heroes, hero_size, hole_limited=bool(placements))
     misses = 0
     while covered.mean() < args.density and misses < 25:
-        misses = 0 if place(mediums, MEDIUM_SIZE, hole_limited=True) else misses + 1
+        misses = 0 if place(mediums, medium_size, hole_limited=True) else misses + 1
     note = ''
     if fillers:
+        f_min, f_max = getattr(args, 'filler_size', (FILLER_MIN_SIZE, FILLER_MAX_SIZE))
         filler_specs = [{'motif': m, 'max': args.filler_max, 'layer': 2,
-                         'min_size': FILLER_MIN_SIZE, 'max_size': FILLER_MAX_SIZE,
+                         'min_size': f_min, 'max_size': f_max,
                          'rotation': rotation_range(m, args) / 2} for m in fillers]
         placements, _, note = fill_gaps(placements, tile, filler_specs, rng)
     return placements, note
