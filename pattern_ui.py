@@ -208,6 +208,61 @@ def save(body):
     return {'saved': str(out_dir / f'{name}.svg'), 'png': bool(png), 'edge_copies': copies}
 
 
+def colors(body):
+    """Area share of each colour on the tile, checked against the 60-30-10 rule."""
+    needs_renderer()
+    import re
+    from PIL import Image
+    placements = [to_tuple(p) for p in body.get('placements', [])]
+    if not placements:
+        raise ValueError('The tile is empty.')
+    used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
+    bg, mapping = palette_of(body.get('palette'), body.get('background'), STATE['motifs'])
+    instances, _ = pc.with_edge_copies(placements, T)
+    svg = pc.build_tile_svg(instances, used, mapping, bg, T, 'colors')
+    svg = re.sub(r'width="[^"]*" height="[^"]*"', 'width="320" height="320"', svg, count=1)
+    image = pc.render_rgba(svg)
+    flat = Image.new('RGB', image.size, bg if bg.startswith('#') else '#ffffff')
+    flat.paste(image, mask=image.getchannel('A'))
+    quant = flat.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+    pal = quant.getpalette()
+    counts = sorted(quant.getcolors(), reverse=True)
+    total = sum(c for c, _ in counts)
+    groups = []   # merge near-identical colours (anti-aliasing)
+    for count, index in counts:
+        rgb = tuple(pal[index * 3:index * 3 + 3])
+        for g in groups:
+            if sum((a - b) ** 2 for a, b in zip(g['rgb'], rgb)) < 40 ** 2:
+                g['count'] += count
+                break
+        else:
+            groups.append({'rgb': rgb, 'count': count})
+    groups.sort(key=lambda g: -g['count'])
+    shares = [{'hex': '#%02x%02x%02x' % g['rgb'], 'share': round(g['count'] / total, 3)}
+              for g in groups if g['count'] / total >= 0.005]
+    main = shares[0]['share'] if shares else 0
+    second = shares[1]['share'] if len(shares) > 1 else 0
+    rest = sum(x['share'] for x in shares[2:])
+    tips = []
+    if main < 0.5:
+        tips.append('No colour dominates (main is under 50%): make the background or the main motifs one '
+                    'calmer colour, or add space between motifs.')
+    elif main > 0.75:
+        tips.append('The main colour takes over 75%: the tile may look empty - enlarge motifs or add some.')
+    if 0 < second < 0.15 and main >= 0.5:
+        tips.append('The second colour is weak (under 15%): give the main motifs one shared colour '
+                    'so they read as a group against the background.')
+    if second > 0.4:
+        tips.append('The second colour competes with the main one (over 40%): shrink or recolour some motifs.')
+    if rest > 0.2:
+        tips.append('Accent colours cover over 20%: too many small bright spots - fewer or smaller accents read better.')
+    elif len(shares) > 2 and rest < 0.04:
+        tips.append('Almost no accent colour: a small bright detail (about 10%) would liven the tile.')
+    if not tips:
+        tips.append('Close to 60-30-10: balanced.')
+    return {'shares': shares, 'tips': tips, 'main': main, 'second': second, 'accents': round(rest, 3)}
+
+
 def list_schemes():
     result = []
     if SCHEME_DIR.is_dir():
@@ -266,6 +321,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length) or b'{}')
         actions = {'/api/load': load_folder, '/api/markup': markup, '/api/fill': fill,
+                   '/api/colors': colors,
                    '/api/auto': auto, '/api/save': save, '/api/save_scheme': save_scheme}
         if self.path not in actions:
             return self.send(404, {'error': 'unknown action'})
@@ -337,6 +393,22 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
   <div id="groupTabs" class="tabs"></div>
   <div id="motifs"><div class="muted">No folder loaded.</div></div>
 
+  <h2>Composition</h2>
+  <label class="muted"><input type="checkbox" id="useRatio"> sizes by ratio: hero, hero x r, hero x r&sup2;</label>
+  <label class="s">Size ratio r (golden = 0.618)<span class="v" id="v_ratio">0.618</span>
+    <input type="range" id="ratio" min="0.4" max="0.9" step="0.002" value="0.618"></label>
+  <label class="s">Hero size for the ratio<span class="v" id="v_ratioBase">0.36</span>
+    <input type="range" id="ratioBase" min="0.12" max="0.6" step="0.01" value="0.36"></label>
+  <div class="row"><button id="ratioApply" title="Resize every motif on the tile by its role">Apply ratio to tile</button></div>
+  <label class="s">Golden ring motifs<span class="v" id="v_ringN">8</span>
+    <input type="range" id="ringN" min="3" max="24" step="1" value="8"></label>
+  <div class="muted">Guides on the tile:</div>
+  <div class="row"><label class="muted"><input type="checkbox" id="gThirds"> thirds</label>
+    <label class="muted"><input type="checkbox" id="gGolden"> golden section</label>
+    <label class="muted"><input type="checkbox" id="gDiag"> diagonals</label></div>
+  <div class="row" style="margin-top:6px"><button id="colorBtn">Check colours 60-30-10</button></div>
+  <div id="colorOut" class="hint"></div>
+
   <h2>Sizes and fillers</h2>
   <div id="slidersMain"></div>
   <details><summary>Auto layout settings</summary><div id="slidersAuto"></div></details>
@@ -363,7 +435,8 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <span class="muted">Selected:</span>
     <button data-act="flip" title="F">Flip</button><button data-act="dup" title="D">Duplicate</button>
     <button data-act="next" title="N">Next motif</button><button data-act="front">To front</button>
-    <button data-act="back">To back</button><button data-act="del" title="Delete">Delete</button>
+    <button data-act="back">To back</button><button data-act="ring" title="Fillers around the selected motif by the golden angle">Golden ring</button>
+    <button data-act="del" title="Delete">Delete</button>
     <span id="selInfo" class="muted"></span>
     <span style="flex:1"></span>
     <span class="muted">Context</span><input type="range" id="ctx" min="0.1" max="1" step="0.05" value="0.5" style="width:90px">
@@ -376,6 +449,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <path id="fadeMask" fill="#ffffff" fill-opacity="0.5" fill-rule="evenodd" pointer-events="none"/>
     <rect id="tileFrame" x="0" y="0" width="1000" height="1000" fill="none" stroke="#000" stroke-opacity=".6"
       stroke-dasharray="8 6" vector-effect="non-scaling-stroke" pointer-events="none"/>
+    <g id="guides" pointer-events="none"></g>
     <g id="selLayer" pointer-events="none"></g>
   </svg></div>
   <div>
@@ -425,6 +499,9 @@ const SCHEMES = {
     [0.55,0.55,'filler',0],[0.05,0.8,'filler',30],[0.8,0.1,'filler',-30],[0.05,0.1,'filler',0]],
   'Vine':vine(),
   'Ditsy':ditsy(),
+  'Golden spiral':(()=>{const s=[[0.5,0.5,'hero',0]];  // phyllotaxis: 137.5 degrees between neighbours
+    for(let i=1;i<=13;i++){const a=i*137.508*Math.PI/180,r=0.13*Math.sqrt(i);
+      s.push([0.5+r*Math.cos(a),0.5+r*Math.sin(a),i<=4?'medium':'filler',i*137.508%360])}return s})(),
   'Toss':[[0.22,0.3,'hero',-10],[0.72,0.78,'hero',12],[0.68,0.22,'medium',35],[0.18,0.78,'medium',-30],
     [0.47,0.52,'medium',150],[0.92,0.47,'medium',-120],[0.45,0.06,'medium',80],
     [0.42,0.3,'filler',0],[0.88,0.12,'filler',40],[0.08,0.55,'filler',-40],[0.6,0.6,'filler',20],
@@ -525,7 +602,10 @@ function renderPalettes(){
 }
 
 /* ---------- placement helpers ---------- */
+function ratioSize(role){const b=+$('ratioBase').value,q=+$('ratio').value;
+  return role==='hero'?b:role==='medium'?b*q:b*q*q}
 function roleSize(role){const s=settings(),r=Math.random();
+  if($('useRatio').checked) return ratioSize(role)*(0.95+0.1*r);
   if(role==='hero') return s.hero_min+r*(s.hero_max-s.hero_min);
   if(role==='medium') return s.medium_min+r*(s.medium_max-s.medium_min);
   return s.filler_min+r*(s.filler_max_size-s.filler_min)}
@@ -623,6 +703,15 @@ function act(a){
   if(a==='dup'){P.push({...p,x:block.on?p.x+40:(p.x+60)%T,y:block.on?p.y+40:(p.y+60)%T});sel=P.length-1}
   if(a==='front'){P.push(P.splice(sel,1)[0]);sel=P.length-1}
   if(a==='back'){P.unshift(P.splice(sel,1)[0]);sel=0}
+  if(a==='ring'){const fill=pool('filler');if(!fill.length){hist.pop();status('Mark some motifs as filler first.');return}
+    const n=+$('ringN').value, base=p.s*T/2, step=137.508*Math.PI/180;   // golden angle around the motif
+    const s0=settings(), fs=(s0.filler_min+s0.filler_max_size)/2, d=fs*T;
+    for(let i=0;i<n;i++){const a=i*step, r=base*0.8+d*0.6+d*0.62*Math.sqrt(i);
+      const m=fill[i%fill.length];
+      P.push({id:m.id,x:p.x+r*Math.cos(a),y:p.y+r*Math.sin(a),s:fs*(1-0.25*i/n),
+        angle:m.upright?0:(a*180/Math.PI+90)%360,flip:1});}
+    if(!block.on) P.forEach(q=>{q.x=mod(q.x);q.y=mod(q.y)});
+  }
   if(a==='next'){const m=byId(p.id);const same=motifs.filter(x=>x.role===m.role&&x.role!=='off');
     if(same.length>1){const k=same.findIndex(x=>x.id===p.id);p.id=same[(k+1)%same.length].id}}
   render();
@@ -676,6 +765,34 @@ async function saveScheme(){
   try{const j=await api('/api/save_scheme',{name,slots});customSchemes=j.schemes;scheme=name.replace(/[^\w-]+/g,'_');renderSchemes();
     status(`Scheme "${name}" saved - it works with any motif folder.`)}catch(e){status(e.message)}
 }
+
+/* ---------- composition helpers ---------- */
+function renderGuides(){
+  const lines=[], add=(x1,y1,x2,y2,c)=>lines.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-opacity=".8"/>`);
+  if($('gThirds').checked) for(const f of [1/3,2/3]){add(f*T,0,f*T,T,'#1a73e8');add(0,f*T,T,f*T,'#1a73e8')}
+  if($('gGolden').checked) for(const f of [0.382,0.618]){add(f*T,0,f*T,T,'#d4a017');add(0,f*T,T,f*T,'#d4a017')}
+  if($('gDiag').checked){add(0,0,T,T,'#c0392b');add(T,0,0,T,'#c0392b')}
+  $('guides').innerHTML=lines.join('');
+}
+async function checkColors(){
+  $('colorOut').textContent='Checking...';
+  try{const j=await api('/api/colors',{placements:concrete(),palette,background:bgValue()});
+    $('colorOut').innerHTML=j.shares.map(c=>`<div class="row" style="flex-wrap:nowrap"><span style="display:inline-block;width:14px;height:14px;border:1px solid #ccc;background:${c.hex}"></span>
+      <span style="flex:1;height:8px;background:#eee;border-radius:4px"><span style="display:block;height:8px;border-radius:4px;width:${Math.round(c.share*100)}%;background:${c.hex};border:1px solid #bbb"></span></span>
+      <span>${Math.round(c.share*100)}%</span></div>`).join('')+
+      `<div style="margin-top:4px">Main ${Math.round(j.main*100)}% · second ${Math.round(j.second*100)}% · accents ${Math.round(j.accents*100)}% (aim 60 · 30 · 10)</div>`+
+      j.tips.map(t=>`<div>• ${t}</div>`).join('');
+  }catch(e){$('colorOut').textContent=e.message}
+}
+function applyRatio(){
+  if(!P.length) return; snapshot();
+  P.forEach(p=>{const role=byId(p.id).role;p.s=ratioSize(role==='off'?'medium':role)});
+  $('useRatio').checked=true; render();
+  status(`Sizes set by ratio ${$('ratio').value}: hero ${ratioSize('hero').toFixed(3)}, medium ${ratioSize('medium').toFixed(3)}, filler ${ratioSize('filler').toFixed(3)}.`);
+}
+['ratio','ratioBase','ringN'].forEach(id=>$(id).oninput=e=>{$('v_'+id).textContent=e.target.value});
+['gThirds','gGolden','gDiag'].forEach(id=>$(id).onchange=renderGuides);
+$('ratioApply').onclick=applyRatio; $('colorBtn').onclick=checkColors;
 
 /* ---------- block mode ---------- */
 function syncBlockUi(){
