@@ -5,7 +5,8 @@ Pattern UI - local web editor for seamless vector patterns (PatternComposer).
 Load a folder of SVG motifs, pick a layout scheme (half-drop, brick, diamond,
 bouquets, vine, ditsy, toss, your own saved schemes, or scored auto layouts),
 then move, rotate, scale, flip, swap, add and delete motifs by hand on a live
-wrap-around tile. A reference tile (any PNG/JPG, e.g. a generated pattern) can
+wrap-around tile. Block mode: build one block (optionally mirror-symmetric)
+and it repeats live on a half-drop, brick or grid lattice. A reference tile (any PNG/JPG, e.g. a generated pattern) can
 be shown underneath as a guide. Fill empty spots with filler motifs, recolour
 with palettes and save the tile, an Illustrator swatch and 3x3 previews.
 
@@ -349,6 +350,15 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <button id="clearBtn">Clear</button>
   </div>
   <div class="bar">
+    <label title="Build one block, it repeats on a lattice"><input type="checkbox" id="blockOn"> <b>Block mode</b></label>
+    <div id="latTabs" class="tabs"></div>
+    <span class="muted">Columns</span><input type="range" id="bNc" min="1" max="6" step="1" value="2" style="width:70px"><span id="v_bNc" class="muted">2</span>
+    <span class="muted">Rows</span><input type="range" id="bNr" min="1" max="6" step="1" value="1" style="width:70px"><span id="v_bNr" class="muted">1</span>
+    <span class="muted">Block scale</span><input type="range" id="bK" min="0.4" max="1.8" step="0.02" value="1" style="width:90px"><span id="v_bK" class="muted">1</span>
+    <label class="muted" title="Left half mirrors the right half"><input type="checkbox" id="bMirror"> mirror</label>
+    <button id="bakeBtn" title="Turn the repeated blocks into free motifs">Bake</button>
+  </div>
+  <div class="bar">
     <button id="undoBtn" title="Ctrl+Z">Undo</button><button id="redoBtn" title="Ctrl+Y">Redo</button>
     <span class="muted">Selected:</span>
     <button data-act="flip" title="F">Flip</button><button data-act="dup" title="D">Duplicate</button>
@@ -422,7 +432,34 @@ const SCHEMES = {
 };
 let motifs=[], palettes=[], customSchemes=[], scheme='Half-drop', palette='original', group='all';
 let P=[], sel=-1, hist=[], future=[], refImg=null, autoLayouts=[], autoSel=null;
+// Block mode: P holds one block (coordinates relative to the block centre); it repeats on a lattice.
+let block={on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false};
+const LATTICES={halfdrop:'Half-drop',brick:'Brick',grid:'Grid'};
 const $=id=>document.getElementById(id), byId=id=>motifs.find(m=>m.id===id);
+const mod=v=>((v%T)+T)%T;
+function latticePoints(){
+  const L=[],w=T/block.nc,h=T/block.nr;
+  for(let c=0;c<block.nc;c++)for(let r=0;r<block.nr;r++){let x=c*w+w/2,y=r*h+h/2;
+    if(block.lattice==='halfdrop'&&c%2) y+=h/2;
+    if(block.lattice==='brick'&&r%2) x+=w/2;
+    L.push([x,y]);}
+  return L;
+}
+function blockItems(){
+  const out=[];
+  P.forEach((p,i)=>{out.push({p,src:i,m:false});
+    if(block.mirror&&Math.abs(p.x)>4) out.push({p:{...p,x:-p.x,angle:-p.angle,flip:-p.flip},src:i,m:true});});
+  return out;
+}
+// Every motif actually drawn on the tile, with a link back to the editable item.
+function expand(){
+  if(!block.on) return P.map((p,i)=>({p,src:i,m:false}));
+  const k=block.k,out=[],items=blockItems();
+  for(const [lx,ly] of latticePoints()) for(const u of items){const q=u.p;
+    out.push({p:{id:q.id,x:mod(lx+q.x*k),y:mod(ly+q.y*k),s:q.s*k,angle:q.angle,flip:q.flip},src:u.src,m:u.m});}
+  return out;
+}
+const concrete=()=>expand().map(e=>e.p);
 
 /* ---------- settings ---------- */
 function sliders(list, el){
@@ -497,13 +534,15 @@ function angleFor(m, base){const s=settings();const lim=(m.upright?s.upright_rot
 function pool(role){const order={hero:['hero','medium','filler'],medium:['medium','hero','filler'],filler:['filler','medium','hero']}[role]||[role];
   for(const r of order){const p=motifs.filter(m=>m.role===r);if(p.length) return p}return []}
 function tdist(a,b){const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y);return Math.hypot(Math.min(dx,T-dx),Math.min(dy,T-dy))}
-function snapshot(){hist.push(JSON.stringify(P));if(hist.length>200)hist.shift();future=[]}
+const stateStr=()=>JSON.stringify({P,block});
+function restore(str){const o=JSON.parse(str);P=o.P;block=o.block;syncBlockUi()}
+function snapshot(){hist.push(stateStr());if(hist.length>200)hist.shift();future=[]}
 
 function applyScheme(){
   if(!motifs.length) return;
   const custom=customSchemes.find(s=>s.name===scheme);
   const slots=custom?custom.slots.map(s=>[s.x,s.y,s.role,s.angle,s.s]):SCHEMES[scheme];
-  snapshot(); const used={}; P=[];
+  snapshot(); block.on=false; syncBlockUi(); const used={}; P=[];
   for(const [x,y,role,ang,size] of slots){
     const options=pool(role); if(!options.length) continue;
     const here={x:x*T,y:y*T};
@@ -517,7 +556,7 @@ function applyScheme(){
 }
 function addMotif(id){
   const m=byId(id); if(!m) return; snapshot();
-  P.push({id,x:T/2,y:T/2,s:roleSize(m.role==='off'?'medium':m.role),angle:angleFor(m,0),flip:1});
+  P.push({id,x:block.on?0:T/2,y:block.on?0:T/2,s:roleSize(m.role==='off'?'medium':m.role),angle:block.on?0:angleFor(m,0),flip:1});
   sel=P.length-1; render();
 }
 
@@ -528,8 +567,8 @@ const OFFS=[];for(const dy of [-T,0,T])for(const dx of [-T,0,T])OFFS.push([dx,dy
 function render(){
   const ctx=parseFloat($('ctx').value)*T;
   $('ed').setAttribute('viewBox',`${-ctx} ${-ctx} ${T+2*ctx} ${T+2*ctx}`);
-  $('inst').innerHTML=P.map((p,i)=>OFFS.map(([dx,dy])=>
-    `<use href="#m${p.id}" xlink:href="#m${p.id}" data-i="${i}" transform="${xform(p,dx,dy)}"/>`).join('')).join('');
+  $('inst').innerHTML=expand().map(e=>OFFS.map(([dx,dy])=>
+    `<use href="#m${e.p.id}" xlink:href="#m${e.p.id}" data-i="${e.src}" data-m="${e.m?1:0}" transform="${xform(e.p,dx,dy)}"/>`).join('')).join('');
   const big=`M${-T} ${-T}H${2*T}V${2*T}H${-T}Z`, hole=`M0 0V${T}H${T}V0Z`;
   $('fadeMask').setAttribute('d',big+hole); $('fadeMask').style.display=$('fade').checked?'':'none';
   renderRef(); renderSel();
@@ -538,8 +577,9 @@ function renderSel(){
   const p=P[sel];
   if(!p){$('selLayer').innerHTML='';$('selInfo').textContent='';return}
   const m=byId(p.id);
-  $('selLayer').innerHTML=OFFS.map(([dx,dy])=>`<g transform="${xform(p,dx,dy)}"><rect x="${m.cx-m.w/2}" y="${m.cy-m.h/2}" width="${m.w}" height="${m.h}"
-    fill="none" stroke="#1a73e8" stroke-width="2" vector-effect="non-scaling-stroke" stroke-dasharray="${dx||dy?'4 4':'none'}"/></g>`).join('');
+  const copies=expand().filter(e=>e.src===sel);
+  $('selLayer').innerHTML=copies.map((e,n)=>(block.on?[[0,0]]:OFFS).map(([dx,dy])=>`<g transform="${xform(e.p,dx,dy)}"><rect x="${m.cx-m.w/2}" y="${m.cy-m.h/2}" width="${m.w}" height="${m.h}"
+    fill="none" stroke="#1a73e8" stroke-width="2" vector-effect="non-scaling-stroke" stroke-dasharray="${(dx||dy||n)?'4 4':'none'}"/></g>`).join('')).join('');
   $('selInfo').textContent=`${m.name} · size ${p.s.toFixed(3)} · ${Math.round(p.angle)}°`;
 }
 function renderRef(){
@@ -555,16 +595,17 @@ $('ed').addEventListener('pointerdown',e=>{
   const i=e.target.dataset?e.target.dataset.i:undefined;
   if(i===undefined){sel=-1;renderSel();return}
   sel=+i; const pt=svgPoint(e); snapshot();
-  drag={x0:pt.x,y0:pt.y,px:P[sel].x,py:P[sel].y,moved:false};
+  const k=block.on?block.k:1, sx=e.target.dataset.m==='1'?-1:1;
+  drag={x0:pt.x,y0:pt.y,px:P[sel].x,py:P[sel].y,moved:false,k,sx};
   $('ed').setPointerCapture(e.pointerId); render();
 });
 $('ed').addEventListener('pointermove',e=>{
   if(!drag) return; const pt=svgPoint(e);
-  P[sel].x=drag.px+pt.x-drag.x0; P[sel].y=drag.py+pt.y-drag.y0; drag.moved=true; render();
+  P[sel].x=drag.px+drag.sx*(pt.x-drag.x0)/drag.k; P[sel].y=drag.py+(pt.y-drag.y0)/drag.k; drag.moved=true; render();
 });
 $('ed').addEventListener('pointerup',()=>{
   if(!drag) return; if(!drag.moved) hist.pop();
-  const p=P[sel]; p.x=((p.x%T)+T)%T; p.y=((p.y%T)+T)%T; drag=null; render();
+  const p=P[sel]; if(!block.on){p.x=mod(p.x);p.y=mod(p.y)} drag=null; render();
 });
 let wheelTimer=null;
 $('ed').addEventListener('wheel',e=>{
@@ -579,7 +620,7 @@ function act(a){
   if(sel<0||!P[sel]) return; snapshot(); const p=P[sel];
   if(a==='flip') p.flip*=-1;
   if(a==='del'){P.splice(sel,1);sel=-1}
-  if(a==='dup'){P.push({...p,x:(p.x+60)%T,y:(p.y+60)%T});sel=P.length-1}
+  if(a==='dup'){P.push({...p,x:block.on?p.x+40:(p.x+60)%T,y:block.on?p.y+40:(p.y+60)%T});sel=P.length-1}
   if(a==='front'){P.push(P.splice(sel,1)[0]);sel=P.length-1}
   if(a==='back'){P.unshift(P.splice(sel,1)[0]);sel=0}
   if(a==='next'){const m=byId(p.id);const same=motifs.filter(x=>x.role===m.role&&x.role!=='off');
@@ -587,8 +628,8 @@ function act(a){
   render();
 }
 document.querySelectorAll('[data-act]').forEach(b=>b.onclick=()=>act(b.dataset.act));
-function undo(){if(!hist.length)return;future.push(JSON.stringify(P));P=JSON.parse(hist.pop());sel=-1;render()}
-function redo(){if(!future.length)return;hist.push(JSON.stringify(P));P=JSON.parse(future.pop());sel=-1;render()}
+function undo(){if(!hist.length)return;future.push(stateStr());restore(hist.pop());sel=-1;render()}
+function redo(){if(!future.length)return;hist.push(stateStr());restore(future.pop());sel=-1;render()}
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT') return;
   const k=e.key.toLowerCase();
@@ -598,11 +639,12 @@ document.addEventListener('keydown',e=>{
   else if(k==='d') act('dup'); else if(k==='f') act('flip'); else if(k==='n') act('next');
   else if(k.startsWith('arrow')&&sel>=0){e.preventDefault();snapshot();const d=e.shiftKey?25:5,p=P[sel];
     if(k==='arrowleft')p.x-=d;if(k==='arrowright')p.x+=d;if(k==='arrowup')p.y-=d;if(k==='arrowdown')p.y+=d;
-    p.x=((p.x%T)+T)%T;p.y=((p.y%T)+T)%T;render()}
+    if(!block.on){p.x=mod(p.x);p.y=mod(p.y)}render()}
 });
 
 /* ---------- server actions ---------- */
 async function fillGaps(){
+  if(block.on) bake();
   status('Filling gaps...');
   try{const j=await api('/api/fill',{placements:P,settings:settings(),...flags()});
     snapshot(); P=j.placements; sel=-1; render(); status(`Added ${j.added} fillers. ${j.note||''}`)}catch(e){status(e.message)}
@@ -610,7 +652,7 @@ async function fillGaps(){
 async function runAuto(){
   $('autoBtn').disabled=true; status('Auto: trying layouts (a few seconds each)...');
   try{const j=await api('/api/auto',{settings:settings(),...flags()});
-    autoLayouts=j.layouts; if(autoLayouts.length){snapshot();P=JSON.parse(JSON.stringify(autoLayouts[0].placements));autoSel=0;sel=-1;render()}
+    autoLayouts=j.layouts; if(autoLayouts.length){snapshot();block.on=false;syncBlockUi();P=JSON.parse(JSON.stringify(autoLayouts[0].placements));autoSel=0;sel=-1;render()}
     renderStrip(); status(`Best ${autoLayouts.length} auto layouts below - click one to edit it.`)}catch(e){status(e.message)}
   $('autoBtn').disabled=false;
 }
@@ -620,20 +662,53 @@ function renderStrip(){
     ${l.placements.map(p=>OFFS.map(([dx,dy])=>`<use href="#m${p.id}" transform="${xform(p,dx,dy)}"/>`).join('')).join('')}</svg>
     #${i+1} · ${l.score.toFixed(2)}</div>`).join('');
   $('strip').querySelectorAll('.cand').forEach(c=>c.onclick=()=>{autoSel=+c.dataset.k;snapshot();
-    P=JSON.parse(JSON.stringify(autoLayouts[autoSel].placements));sel=-1;render();renderStrip()});
+    block.on=false;syncBlockUi();P=JSON.parse(JSON.stringify(autoLayouts[autoSel].placements));sel=-1;render();renderStrip()});
 }
 async function savePattern(){
   status('Saving...');
-  try{const j=await api('/api/save',{placements:P,palette,background:bgValue(),name:$('saveName').value});
+  try{const j=await api('/api/save',{placements:concrete(),palette,background:bgValue(),name:$('saveName').value});
     status('Saved: '+j.saved+(j.png?'':' (PNG preview needs resvg-py)'))}catch(e){status(e.message)}
 }
 async function saveScheme(){
   const name=$('saveName').value.trim()||prompt('Scheme name:'); if(!name) return;
-  const slots=P.map(p=>({x:+(p.x/T).toFixed(4),y:+(p.y/T).toFixed(4),role:byId(p.id).role==='off'?'medium':byId(p.id).role,
+  const slots=concrete().map(p=>({x:+(p.x/T).toFixed(4),y:+(p.y/T).toFixed(4),role:byId(p.id).role==='off'?'medium':byId(p.id).role,
     angle:Math.round(p.angle),s:+p.s.toFixed(4)}));
   try{const j=await api('/api/save_scheme',{name,slots});customSchemes=j.schemes;scheme=name.replace(/[^\w-]+/g,'_');renderSchemes();
     status(`Scheme "${name}" saved - it works with any motif folder.`)}catch(e){status(e.message)}
 }
+
+/* ---------- block mode ---------- */
+function syncBlockUi(){
+  $('blockOn').checked=block.on; $('bMirror').checked=block.mirror;
+  $('bNc').value=block.nc; $('v_bNc').textContent=block.nc;
+  $('bNr').value=block.nr; $('v_bNr').textContent=block.nr;
+  $('bK').value=block.k; $('v_bK').textContent=(+block.k).toFixed(2);
+  $('latTabs').innerHTML=Object.entries(LATTICES).map(([k,l])=>`<button class="${k===block.lattice?'on':''}" data-l="${k}">${l}</button>`).join('');
+  $('latTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{snapshot();block.lattice=b.dataset.l;fixLattice();syncBlockUi();render()});
+}
+function fixLattice(){  // a half-drop needs an even column count, a brick an even row count
+  if(block.lattice==='halfdrop'&&block.nc%2) block.nc=Math.min(6,block.nc+1);
+  if(block.lattice==='brick'&&block.nr%2) block.nr=Math.min(6,block.nr+1);
+}
+function enterBlock(){
+  snapshot();
+  let unit;
+  if(sel>=0&&P[sel]) unit=[{...P[sel],x:0,y:0,angle:0}];
+  else{const heroes=pool('hero');if(!heroes.length){status('Load motifs first.');return syncBlockUi()}
+    unit=[{id:heroes[0].id,x:0,y:0,s:0.45,angle:0,flip:1}]}
+  P=unit; sel=0; block.on=true; fixLattice(); syncBlockUi(); render();
+  status('Block mode: edit one block - every copy follows. Click motif pictures to add them to the block, turn on mirror for symmetry.');
+}
+function bake(){
+  if(!block.on) return; snapshot(); P=concrete(); block.on=false; sel=-1; syncBlockUi(); render();
+  status('Blocks baked into free motifs - you can now edit every copy on its own.');
+}
+$('blockOn').onchange=()=>{$('blockOn').checked?enterBlock():bake()};
+$('bakeBtn').onclick=bake;
+$('bMirror').onchange=()=>{snapshot();block.mirror=$('bMirror').checked;render()};
+['bNc','bNr'].forEach(id=>$(id).oninput=e=>{snapshot();block[id==='bNc'?'nc':'nr']=+e.target.value;fixLattice();syncBlockUi();render()});
+$('bK').oninput=e=>{block.k=+e.target.value;$('v_bK').textContent=block.k.toFixed(2);render()};
+syncBlockUi();
 
 /* ---------- wiring ---------- */
 sliders(MAIN,'slidersMain'); sliders(AUTO,'slidersAuto');
