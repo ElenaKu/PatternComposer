@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 composed_patterns/
+schemes/
+palettes/

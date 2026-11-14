@@ -5,7 +5,10 @@ Pattern UI - local web editor for seamless vector patterns (PatternComposer).
 Load a folder of SVG motifs, pick a layout scheme (half-drop, brick, diamond,
 bouquets, vine, ditsy, toss, your own saved schemes, or scored auto layouts),
 then move, rotate, scale, flip, swap, add and delete motifs by hand on a live
-wrap-around tile. Block mode: build one block (optionally mirror-symmetric)
+wrap-around tile. Colour: built-in and saved palettes, palettes from an image,
+imported palettes (hex lists, QuiltFlow JSON, .ase, .gpl), OKLCH colour harmonies,
+recolouring by lightness with manual per-colour changes, a B/W check and a
+colourways sheet. Block mode: build one block (optionally mirror-symmetric)
 and it repeats live on a half-drop, brick or grid lattice. A reference tile (any PNG/JPG, e.g. a generated pattern) can
 be shown underneath as a guide. Fill empty spots with filler motifs, recolour
 with palettes and save the tile, an Illustrator swatch and 3x3 previews.
@@ -36,6 +39,7 @@ import PatternComposer as pc
 
 HOST, PORT = '127.0.0.1', 8769
 SCHEME_DIR = Path(__file__).resolve().parent / 'schemes'
+PALETTE_DIR = Path(__file__).resolve().parent / 'palettes'
 T = pc.TILE_SIZE
 
 STATE = {'folder': None, 'motifs': [], 'preload': ''}
@@ -74,10 +78,35 @@ def apply_flags(body):
         m.upright = bool(upright.get(str(m.index), m.upright))
 
 
-def palette_of(palette, background, motifs):
-    choice = (pc.choose_palettes([palette or 'original'], motifs, background or None)
-              or pc.choose_palettes(['original'], motifs, background or None))
-    _, bg, mapping = choice[0]
+def palette_name(spec):
+    if isinstance(spec, dict):
+        return pc.safe_name(spec.get('name') or 'custom') or 'custom'
+    return spec or 'original'
+
+
+def palette_of(spec, background, motifs, remap=None):
+    """Palette spec = built-in name or {'name', 'bg', 'colors'}; remap = {original: new}.
+
+    Motif colours go to palette colours by lightness rank, so the drawing keeps
+    its light-to-dark structure.
+    """
+    if isinstance(spec, dict):
+        colors = [c for c in (pc.normalize_color(x) for x in spec.get('colors', [])) if c]
+        if colors:
+            all_colors = sorted({c for m in motifs for c in m.colors})
+            mapping = pc.palette_mapping(all_colors, colors)
+            bg = pc.normalize_color(spec.get('bg') or '') or '#f6f1e7'
+        else:
+            _, bg, mapping = pc.choose_palettes(['original'], motifs, spec.get('bg') or None)[0]
+    else:
+        choice = (pc.choose_palettes([spec or 'original'], motifs, background or None)
+                  or pc.choose_palettes(['original'], motifs, background or None))
+        _, bg, mapping = choice[0]
+    mapping = dict(mapping)
+    for src, dst in (remap or {}).items():
+        src, dst = pc.normalize_color(src), pc.normalize_color(dst)
+        if src and dst:
+            mapping[src] = dst
     return (background or bg), mapping
 
 
@@ -117,7 +146,9 @@ def load_folder(body):
                     'cx': (m.bbox[0] + m.bbox[2]) / 2, 'cy': (m.bbox[1] + m.bbox[3]) / 2,
                     'group': str(m.path.parent.relative_to(folder)).replace('\\', '/')}
                    for m in motifs],
-        'palettes': ['original'] + list(pc.PALETTES),
+        'palettes': [{'name': 'original', 'bg': '', 'colors': []}]
+                    + [{'name': n, 'bg': bg, 'colors': c} for n, (bg, c) in pc.PALETTES.items()],
+        'saved_palettes': list_palettes(),
         'schemes': list_schemes(),
     }
 
@@ -125,8 +156,10 @@ def load_folder(body):
 def markup(body):
     """Motif drawings recoloured for the palette, ready for the editor <defs>."""
     motifs = STATE['motifs']
-    bg, mapping = palette_of(body.get('palette'), body.get('background'), motifs)
-    return {'bg': bg, 'motifs': [
+    bg, mapping = palette_of(body.get('palette'), body.get('background'), motifs, body.get('remap'))
+    originals = sorted({c for m in motifs for c in m.colors}, key=pc.lightness)
+    return {'bg': bg, 'colors': [{'orig': c, 'now': mapping.get(c, c)} for c in originals],
+            'motifs': [
         {'id': m.index, 'defs': pc.recolor_markup(m.defs_markup, mapping) if m.defs_markup else '',
          'body': pc.recolor_markup(m.body_markup, mapping)} for m in motifs]}
 
@@ -186,9 +219,10 @@ def save(body):
     for directory in (out_dir, swatch_dir, preview_dir):
         pc.ensure_dir(directory)
     used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
-    palette = body.get('palette') or 'original'
-    bg, mapping = palette_of(palette, body.get('background'), STATE['motifs'])
-    name = pc.safe_name(body.get('name') or '') or pc.safe_name(folder.name)
+    palette = palette_name(body.get('palette'))
+    bg, mapping = palette_of(body.get('palette'), body.get('background'), STATE['motifs'],
+                             body.get('remap'))
+    name = pc.safe_name(body['name']) if (body.get('name') or '').strip() else pc.safe_name(folder.name)
     name = f'{name}_{pc.safe_name(palette)}'
     stem, n = name, 2
     while (out_dir / f'{name}.svg').exists():
@@ -202,7 +236,7 @@ def save(body):
     (preview_dir / f'{name}_preview_3x3.svg').write_text(preview, encoding='utf-8')
     png = pc.render_png(preview, preview_dir / f'{name}_preview_3k.png')
     (out_dir / f'{name}.layout.json').write_text(json.dumps(
-        {'palette': palette, 'background': bg, 'motif_folder': str(folder),
+        {'palette': palette, 'background': bg, 'colour_map': mapping, 'motif_folder': str(folder),
          'placements': [dict(to_client(t), name=t[0].name) for t in placements]}, indent=1),
         encoding='utf-8')
     return {'saved': str(out_dir / f'{name}.svg'), 'png': bool(png), 'edge_copies': copies}
@@ -217,7 +251,8 @@ def colors(body):
     if not placements:
         raise ValueError('The tile is empty.')
     used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
-    bg, mapping = palette_of(body.get('palette'), body.get('background'), STATE['motifs'])
+    bg, mapping = palette_of(body.get('palette'), body.get('background'), STATE['motifs'],
+                             body.get('remap'))
     instances, _ = pc.with_edge_copies(placements, T)
     svg = pc.build_tile_svg(instances, used, mapping, bg, T, 'colors')
     svg = re.sub(r'width="[^"]*" height="[^"]*"', 'width="320" height="320"', svg, count=1)
@@ -261,6 +296,76 @@ def colors(body):
     if not tips:
         tips.append('Close to 60-30-10: balanced.')
     return {'shares': shares, 'tips': tips, 'main': main, 'second': second, 'accents': round(rest, 3)}
+
+
+def colorways(body):
+    """The same tile in several palettes, as standalone SVG tiles."""
+    placements = [to_tuple(p) for p in body.get('placements', [])]
+    if not placements:
+        raise ValueError('The tile is empty.')
+    used = sorted({p[0].index: p[0] for p in placements}.values(), key=lambda m: m.index)
+    instances, _ = pc.with_edge_copies(placements, T)
+    out = []
+    for i, spec in enumerate(body.get('palettes', [])):
+        first = i == 0   # the current palette keeps your manual colour changes and background
+        bg, mapping = palette_of(spec, body.get('background', '') if first else '', STATE['motifs'],
+                                 body.get('remap') if first else None)
+        out.append({'name': palette_name(spec), 'spec': spec, 'bg': bg,
+                    'svg': pc.build_tile_svg(instances, used, mapping, bg, T, palette_name(spec))})
+    return {'colorways': out}
+
+
+def extract_palette(body):
+    """Main colours of an image (data URL): most common one as background."""
+    import base64
+    import io
+    from PIL import Image
+    data = body.get('image', '')
+    if ',' in data:
+        data = data.split(',', 1)[1]
+    image = Image.open(io.BytesIO(base64.b64decode(data))).convert('RGB')
+    image.thumbnail((240, 240))
+    n = max(3, min(10, int(body.get('count', 6))))
+    quant = image.quantize(colors=n + 6, method=Image.Quantize.MEDIANCUT)
+    pal = quant.getpalette()
+    groups = []
+    for count, index in sorted(quant.getcolors(), reverse=True):
+        rgb = tuple(pal[index * 3:index * 3 + 3])
+        for g in groups:
+            if sum((a - b) ** 2 for a, b in zip(g['rgb'], rgb)) < 30 ** 2:
+                g['count'] += count
+                break
+        else:
+            groups.append({'rgb': rgb, 'count': count})
+    groups.sort(key=lambda g: -g['count'])
+    hexes = ['#%02x%02x%02x' % g['rgb'] for g in groups[:n + 1]]
+    return {'bg': hexes[0], 'colors': hexes[1:] or hexes}
+
+
+def list_palettes():
+    result = []
+    if PALETTE_DIR.is_dir():
+        for path in sorted(PALETTE_DIR.glob('*.json')):
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                result.append({'name': path.stem, 'bg': data.get('bg', ''), 'colors': data['colors'],
+                               'saved': True})
+            except Exception:
+                pass
+    return result
+
+
+def save_palette(body):
+    spec = body.get('palette') or {}
+    name = pc.safe_name(spec.get('name') or '')
+    colors = [c for c in (pc.normalize_color(x) for x in spec.get('colors', [])) if c]
+    if not name or not colors:
+        raise ValueError('A palette needs a name and at least one colour.')
+    pc.ensure_dir(PALETTE_DIR)
+    (PALETTE_DIR / f'{name}.json').write_text(
+        json.dumps({'bg': pc.normalize_color(spec.get('bg') or '') or '', 'colors': colors}, indent=1),
+        encoding='utf-8')
+    return {'palettes': list_palettes()}
 
 
 def list_schemes():
@@ -321,7 +426,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length) or b'{}')
         actions = {'/api/load': load_folder, '/api/markup': markup, '/api/fill': fill,
-                   '/api/colors': colors,
+                   '/api/colors': colors, '/api/colorways': colorways,
+                   '/api/extract': extract_palette, '/api/save_palette': save_palette,
                    '/api/auto': auto, '/api/save': save, '/api/save_scheme': save_scheme}
         if self.path not in actions:
             return self.send(404, {'error': 'unknown action'})
@@ -374,6 +480,18 @@ label.s input{grid-column:1/3;width:100%}
 .cand.on{border-color:var(--accent)}
 .cand svg{width:96px;height:96px;display:block}
 details{margin-top:6px}
+.sw{display:inline-block;width:18px;height:18px;border:1px solid rgba(0,0,0,.15);border-radius:3px;vertical-align:middle}
+.palbtn{display:flex;align-items:center;gap:6px;width:100%;justify-content:space-between;margin:3px 0}
+.palbtn.on{outline:2px solid var(--accent)}
+.strip4{display:flex;gap:2px}
+.cmap{display:flex;align-items:center;gap:4px;margin:2px 8px 2px 0}
+.cmap input[type=color]{width:26px;height:22px;padding:0;border:1px solid var(--line);border-radius:4px}
+textarea{width:100%;height:70px;font:12px monospace;border:1px solid var(--line);border-radius:6px;padding:6px}
+#cwOverlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:10;overflow:auto;padding:24px}
+#cwBox{background:#fff;border-radius:10px;padding:14px;max-width:1300px;margin:0 auto}
+#cwGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
+.cw .tile{height:240px;border-radius:6px;background-repeat:repeat;background-size:120px 120px;border:1px solid var(--line)}
+#ed.gray{filter:grayscale(1)}
 summary{cursor:pointer;color:var(--muted);font-size:12px}
 .hint{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5}
 </style></head><body>
@@ -388,6 +506,15 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <input type="range" id="refOp" min="0" max="1" step="0.05" value="0.35"></label>
   <div class="row"><label class="muted"><input type="checkbox" id="refRepeat" checked> repeat around</label>
     <button id="refClear">Remove</button></div>
+
+  <h2>Colour</h2>
+  <div id="colTabs" class="tabs"></div>
+  <div id="colPane" style="margin-top:6px"></div>
+  <div class="row" style="margin-top:6px"><span class="muted">Background</span><input type="color" id="bgColor" value="#f6f1e7">
+    <label class="muted"><input type="checkbox" id="customBg"> own background</label></div>
+  <div class="muted" style="margin-top:6px">Colour map - original &rarr; now (click to change):</div>
+  <div id="colorMap" class="row" style="gap:0"></div>
+  <div class="row" style="margin-top:6px;flex-wrap:nowrap"><input type="text" id="palName" placeholder="palette name"><button id="palSave">Save palette</button></div>
 
   <h2>Motifs <span class="muted" style="text-transform:none;letter-spacing:0">click a picture to add it</span></h2>
   <div id="groupTabs" class="tabs"></div>
@@ -452,12 +579,14 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <g id="guides" pointer-events="none"></g>
     <g id="selLayer" pointer-events="none"></g>
   </svg></div>
+  <div id="cwOverlay"><div id="cwBox"><div class="row"><b>Colourways</b><span class="muted">the same tile in every palette - Use to edit, Save to export</span>
+    <span style="flex:1"></span><button id="cwSaveAll">Save all</button><button id="cwClose">Close</button></div><div id="cwGrid"></div></div></div>
   <div>
     <div class="strip" id="strip"></div>
     <div class="bar" style="border-top:1px solid var(--line);border-bottom:0">
-      <span class="muted">Palette</span><div id="palTabs" class="tabs"></div>
-      <input type="color" id="bgColor" value="#f6f1e7" title="Background">
-      <label class="muted"><input type="checkbox" id="customBg"> own background</label>
+      <span class="muted">Palette:</span><span id="curPal" class="row" style="gap:3px"></span>
+      <label class="muted" title="Check the light-dark structure"><input type="checkbox" id="gray"> B/W check</label>
+      <button id="cwBtn">Colourways</button>
       <span style="flex:1"></span>
       <input type="text" id="saveName" placeholder="name (optional)" style="width:160px">
       <button id="schemeSaveBtn">Save as scheme</button>
@@ -507,7 +636,8 @@ const SCHEMES = {
     [0.42,0.3,'filler',0],[0.88,0.12,'filler',40],[0.08,0.55,'filler',-40],[0.6,0.6,'filler',20],
     [0.32,0.62,'filler',60],[0.9,0.95,'filler',-20],[0.05,0.05,'filler',10],[0.55,0.92,'filler',0]],
 };
-let motifs=[], palettes=[], customSchemes=[], scheme='Half-drop', palette='original', group='all';
+let motifs=[], palettes=[], savedPalettes=[], customSchemes=[], scheme='Half-drop', group='all';
+let curPal={name:'original',bg:'',colors:[]}, remap={}, colTab='Palettes', draftPal=null, colorways=[];
 let P=[], sel=-1, hist=[], future=[], refImg=null, autoLayouts=[], autoSel=null;
 // Block mode: P holds one block (coordinates relative to the block centre); it repeats on a lattice.
 let block={on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false};
@@ -559,19 +689,19 @@ async function load(){
   status('Loading...');
   try{
     const j=await api('/api/load',{folder:$('folder').value});
-    motifs=j.motifs; palettes=j.palettes; customSchemes=j.schemes; group='all';
+    motifs=j.motifs; palettes=j.palettes; savedPalettes=j.saved_palettes; customSchemes=j.schemes; group='all';
     try{localStorage.setItem('pui_folder',j.folder)}catch(e){}
     $('skipped').textContent=j.skipped.length?'Skipped: '+j.skipped.join('; '):'';
     P=[];sel=-1;hist=[];future=[];autoLayouts=[];
-    renderMotifs(); renderSchemes(); renderPalettes(); await loadMarkup(); applyScheme();
+    renderMotifs(); renderSchemes(); renderColour(); await loadMarkup(); applyScheme();
     status(`${motifs.length} motifs loaded. Pick a scheme, then drag motifs to adjust.`);
   }catch(e){status(e.message)}
 }
 async function loadMarkup(){
-  const j=await api('/api/markup',{palette,background:bgValue()});
+  const j=await api('/api/markup',{palette:spec(),remap,background:bgValue()});
   $('mdefs').innerHTML=j.motifs.map(m=>`${m.defs}<g id="m${m.id}">${m.body}</g>`).join('');
   $('bgRect').setAttribute('fill',j.bg); if(!$('customBg').checked) $('bgColor').value=toHex(j.bg);
-  render(); renderStrip();
+  renderColorMap(j.colors); renderCurPal(); render(); renderStrip();
 }
 function toHex(c){return /^#[0-9a-f]{6}$/i.test(c)?c:'#f6f1e7'}
 function bgValue(){return $('customBg').checked?$('bgColor').value:''}
@@ -596,10 +726,7 @@ function renderSchemes(){
   $('schemeTabs').innerHTML=names.map(n=>`<button class="${n===scheme?'on':''}" data-s="${n}">${n}</button>`).join('');
   $('schemeTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{scheme=b.dataset.s;renderSchemes();applyScheme()});
 }
-function renderPalettes(){
-  $('palTabs').innerHTML=palettes.map(p=>`<button class="${p===palette?'on':''}" data-p="${p}">${p}</button>`).join('');
-  $('palTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{palette=b.dataset.p;renderPalettes();loadMarkup()});
-}
+
 
 /* ---------- placement helpers ---------- */
 function ratioSize(role){const b=+$('ratioBase').value,q=+$('ratio').value;
@@ -755,7 +882,7 @@ function renderStrip(){
 }
 async function savePattern(){
   status('Saving...');
-  try{const j=await api('/api/save',{placements:concrete(),palette,background:bgValue(),name:$('saveName').value});
+  try{const j=await api('/api/save',{placements:concrete(),palette:spec(),remap,background:bgValue(),name:$('saveName').value});
     status('Saved: '+j.saved+(j.png?'':' (PNG preview needs resvg-py)'))}catch(e){status(e.message)}
 }
 async function saveScheme(){
@@ -765,6 +892,151 @@ async function saveScheme(){
   try{const j=await api('/api/save_scheme',{name,slots});customSchemes=j.schemes;scheme=name.replace(/[^\w-]+/g,'_');renderSchemes();
     status(`Scheme "${name}" saved - it works with any motif folder.`)}catch(e){status(e.message)}
 }
+
+/* ---------- colour ---------- */
+const spec=()=>curPal.colors.length?{name:curPal.name,bg:curPal.bg,colors:curPal.colors}:(curPal.name==='original'?'original':{name:curPal.name,bg:curPal.bg,colors:[]});
+const swatches=cs=>`<span class="strip4">${cs.map(c=>`<span class="sw" style="background:${c}" title="${c}"></span>`).join('')}</span>`;
+function usePalette(p){curPal={name:p.name,bg:p.bg||'',colors:[...(p.colors||[])]};remap={};
+  if(p.bg&&!$('customBg').checked) $('bgColor').value=toHex(p.bg); $('palName').value=p.name==='original'?'':p.name;
+  renderColour(); loadMarkup();}
+function renderCurPal(){$('curPal').innerHTML=`<b style="font-size:12px">${curPal.name}</b> `+swatches([$('bgRect').getAttribute('fill'),...curPal.colors])}
+function renderColorMap(list){
+  $('colorMap').innerHTML=list.map(c=>`<span class="cmap"><span class="sw" style="background:${c.orig}"></span>&rarr;<input type="color" data-orig="${c.orig}" value="${toHex(c.now)}"></span>`).join('');
+  $('colorMap').querySelectorAll('input').forEach(i=>i.onchange=()=>{remap[i.dataset.orig]=i.value;loadMarkup()});
+}
+const COLTABS=['Palettes','From image','Import','Harmony'];
+function renderColour(){
+  $('colTabs').innerHTML=COLTABS.map(t=>`<button class="${t===colTab?'on':''}" data-t="${t}">${t}</button>`).join('');
+  $('colTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{colTab=b.dataset.t;draftPal=null;renderColour()});
+  const pane=$('colPane');
+  if(colTab==='Palettes'){
+    const all=[...palettes,...savedPalettes];
+    pane.innerHTML=all.map((p,i)=>`<button class="palbtn ${p.name===curPal.name?'on':''}" data-i="${i}"><span>${p.name}${p.saved?' ★':''}</span>${swatches([p.bg||'#ffffff',...p.colors].filter(Boolean))}</button>`).join('');
+    pane.querySelectorAll('.palbtn').forEach(b=>b.onclick=()=>usePalette(all[+b.dataset.i]));
+  } else if(colTab==='From image'){
+    pane.innerHTML=`<div class="row"><button id="exRef">From reference tile</button><input type="file" id="exFile" accept="image/*" style="max-width:100%"></div>
+      <label class="s">Colours<span class="v" id="v_exN">6</span><input type="range" id="exN" min="3" max="10" step="1" value="6"></label><div id="draft"></div>`;
+    $('exN').oninput=e=>$('v_exN').textContent=e.target.value;
+    $('exRef').onclick=()=>refImg?extract(refImg):status('Load a reference tile first (Reference tile section).');
+    $('exFile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>extract(r.result);r.readAsDataURL(f)};
+  } else if(colTab==='Import'){
+    pane.innerHTML=`<textarea id="impText" placeholder="#DA8B34 #2E1C2B #F1E4CB ...  or a QuiltFlow JSON"></textarea>
+      <div class="row"><button id="impParse">Read text</button><input type="file" id="impFile" accept=".ase,.gpl,.json,.txt,.hex,.css" style="max-width:100%"></div>
+      <div class="hint">Hex lists, QuiltFlow JSON, Adobe swatches (.ase), GIMP / Inkscape palettes (.gpl). The first colour becomes the background - change it below.</div><div id="draft"></div>`;
+    $('impParse').onclick=()=>showDraft(parseText($('impText').value),'imported');
+    $('impFile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+      if(/\.ase$/i.test(f.name)){r.onload=()=>showDraft(parseAse(r.result),f.name.replace(/\.\w+$/,''));r.readAsArrayBuffer(f)}
+      else{r.onload=()=>showDraft(parseText(r.result),f.name.replace(/\.\w+$/,''));r.readAsText(f)}};
+  } else {
+    pane.innerHTML=`<div class="row"><span class="muted">Base colour</span><input type="color" id="hBase" value="#c0542f"></div>
+      <div id="hTypes" class="tabs" style="margin-top:4px"></div>
+      <label class="s">Colours<span class="v" id="v_hN">5</span><input type="range" id="hN" min="3" max="7" step="1" value="5"></label>
+      <div id="hBg" class="tabs"></div><div id="draft"></div>`;
+    harmonyUi();
+  }
+}
+function showDraft(colors,name,bg){
+  colors=[...new Set(colors.map(c=>c.toLowerCase()))];
+  if(!colors.length){status('No colours found.');return}
+  draftPal={name:(name||'custom').replace(/[^\w-]+/g,'_'),bg:bg||colors[0],colors:bg?colors:colors.slice(1).length?colors.slice(1):colors};
+  $('draft').innerHTML=`<div class="row" style="margin-top:6px"><span class="muted">bg</span>${swatches([draftPal.bg])}<span class="muted">colours</span>${swatches(draftPal.colors)}
+    <button id="draftUse" class="primary">Use</button></div>`;
+  $('draftUse').onclick=()=>usePalette(draftPal);
+}
+async function extract(dataUrl){
+  try{const j=await api('/api/extract',{image:dataUrl,count:+$('exN').value});showDraft(j.colors,'from_image',j.bg)}catch(e){status(e.message)}
+}
+function parseText(t){
+  try{const j=JSON.parse(t);const hx=j?.collection?.palette?.allHexCodes||j.allHexCodes||j.colors;
+    if(Array.isArray(hx)){const out=hx.map(x=>typeof x==='string'?x:x.hex).filter(Boolean);
+      const bg=j?.collection?.palette?.mainColors?.map(c=>c.hex).sort((a,b)=>lum(b)-lum(a))[0];
+      return bg?[bg,...out.filter(c=>c.toLowerCase()!==bg.toLowerCase())]:out}}catch(e){}
+  const hex=[...t.matchAll(/#?\b([0-9a-f]{6})\b/gi)].map(m=>'#'+m[1]);
+  if(hex.length) return hex;
+  return t.split('\n').map(l=>l.trim().match(/^(\d+)\s+(\d+)\s+(\d+)/)).filter(Boolean)   // GIMP .gpl lines
+    .map(m=>'#'+[m[1],m[2],m[3]].map(v=>(+v).toString(16).padStart(2,'0')).join(''));
+}
+function parseAse(buf){   // Adobe Swatch Exchange: RGB, CMYK, Gray and LAB colour entries
+  const v=new DataView(buf),out=[];let o=12;const n=v.getUint32(8);
+  const hex=(r,g,b)=>'#'+[r,g,b].map(x=>Math.round(Math.max(0,Math.min(1,x))*255).toString(16).padStart(2,'0')).join('');
+  for(let i=0;i<n&&o<buf.byteLength;i++){const type=v.getUint16(o),len=v.getUint32(o+2);let q=o+6;
+    if(type===1){const nl=v.getUint16(q);q+=2+nl*2;const model=String.fromCharCode(...new Uint8Array(buf,q,4));q+=4;
+      const f=k=>v.getFloat32(q+4*k);
+      if(model==='RGB ') out.push(hex(f(0),f(1),f(2)));
+      else if(model==='CMYK') out.push(hex((1-f(0))*(1-f(3)),(1-f(1))*(1-f(3)),(1-f(2))*(1-f(3))));
+      else if(model==='Gray') out.push(hex(f(0),f(0),f(0)));
+      else if(model==='LAB '){const [L,a,b]=[f(0)*100,f(1),f(2)];out.push(labHex(L,a,b))}}
+    o+=6+len;}
+  return out;
+}
+function labHex(L,a,b){let y=(L+16)/116,x=a/500+y,z=y-b/200;const f=t=>t**3>0.008856?t**3:(t-16/116)/7.787;
+  x=0.95047*f(x);y=f(y);z=1.08883*f(z);
+  const r=3.2406*x-1.5372*y-0.4986*z,g=-0.9689*x+1.8758*y+0.0415*z,bb=0.0557*x-0.204*y+1.057*z;
+  const gm=c=>c>0.0031308?1.055*c**(1/2.4)-0.055:12.92*c;
+  return '#'+[r,g,bb].map(c=>Math.round(Math.max(0,Math.min(1,gm(c)))*255).toString(16).padStart(2,'0')).join('')}
+// OKLCH: perceptual colour space - equal lightness numbers look equally light
+function hexToOklch(h){const c=[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)/255).map(x=>x<=0.04045?x/12.92:((x+0.055)/1.055)**2.4);
+  const l=Math.cbrt(0.4122214708*c[0]+0.5363325363*c[1]+0.0514459929*c[2]),m=Math.cbrt(0.2119034982*c[0]+0.6806995451*c[1]+0.1073969566*c[2]),
+    s=Math.cbrt(0.0883024619*c[0]+0.2817188376*c[1]+0.6299787005*c[2]);
+  const L=0.2104542553*l+0.7936177850*m-0.0040720468*s,a=1.9779984951*l-2.4285922050*m+0.4505937099*s,b=0.0259040371*l+0.7827717662*m-0.8086757660*s;
+  return [L,Math.hypot(a,b),(Math.atan2(b,a)*180/Math.PI+360)%360]}
+function oklchRgb(L,C,H){const a=C*Math.cos(H*Math.PI/180),b=C*Math.sin(H*Math.PI/180);
+  const l=(L+0.3963377774*a+0.2158037573*b)**3,m=(L-0.1055613458*a-0.0638541728*b)**3,s=(L-0.0894841775*a-1.2914855480*b)**3;
+  return [4.0767416621*l-3.3077115913*m+0.2309699292*s,-1.2684380046*l+2.6097574011*m-0.3413193965*s,-0.0041960863*l-0.7034186147*m+1.7076147010*s]}
+function oklchHex(L,C,H){let lo=0,hi=C;   // shrink chroma until the colour fits sRGB
+  const ok=c=>oklchRgb(L,c,H).every(v=>v>=-0.001&&v<=1.001);
+  if(!ok(C)){for(let i=0;i<20;i++){const mid=(lo+hi)/2;ok(mid)?lo=mid:hi=mid}C=lo}
+  const gm=c=>{c=Math.max(0,Math.min(1,c));return c>0.0031308?1.055*c**(1/2.4)-0.055:12.92*c};
+  return '#'+oklchRgb(L,C,H).map(c=>Math.round(gm(c)*255).toString(16).padStart(2,'0')).join('')}
+const lum=h=>hexToOklch(h)[0];
+const HARMONIES={Analogous:[0,30,-30,60,-60],Complementary:[0,180,0,180,0],Split:[0,150,210,0,150],Triad:[0,120,240,0,120],Tetrad:[0,90,180,270,0],Monochrome:[0,0,0,0,0]};
+let hType='Analogous', hBgMode='Light';
+function harmonyUi(){
+  $('hTypes').innerHTML=Object.keys(HARMONIES).map(t=>`<button class="${t===hType?'on':''}" data-t="${t}">${t}</button>`).join('');
+  $('hBg').innerHTML=['Light','Dark'].map(t=>`<button class="${t===hBgMode?'on':''}" data-b="${t}">${t} background</button>`).join('');
+  $('hTypes').querySelectorAll('button').forEach(b=>b.onclick=()=>{hType=b.dataset.t;harmonyUi()});
+  $('hBg').querySelectorAll('button').forEach(b=>b.onclick=()=>{hBgMode=b.dataset.b;harmonyUi()});
+  $('hN').oninput=e=>{$('v_hN').textContent=e.target.value;makeHarmony()}; $('hBase').oninput=makeHarmony;
+  makeHarmony();
+}
+function makeHarmony(){
+  const [L0,C0,H0]=hexToOklch($('hBase').value), n=+$('hN').value, offs=HARMONIES[hType];
+  const C=Math.max(0.04,Math.min(C0,0.17)), colors=[];
+  for(let i=0;i<n;i++){const L=0.32+0.56*i/(n-1);   // even light-to-dark ladder
+    const taper=1-0.65*Math.max(0,(L-0.68)/0.2)-0.2*Math.max(0,(0.42-L)/0.1);   // very light/dark: less saturated
+    colors.push(oklchHex(L,C*taper*(hType==='Monochrome'?1:(i%2?0.8:1)),(H0+offs[i%offs.length]+360)%360))}
+  const bg=hBgMode==='Light'?oklchHex(0.96,0.015,H0):oklchHex(0.22,0.03,H0);
+  showDraft(colors,`${hType.toLowerCase()}_${$('hBase').value.slice(1)}`,bg);
+}
+async function savePalette(){
+  const name=$('palName').value.trim(); if(!name){status('Type a palette name first.');return}
+  const colors=curPal.colors.length?curPal.colors.map(c=>remap[c]||c):[...new Set(Object.values(remap))];
+  const bg=$('bgRect').getAttribute('fill');
+  try{const j=await api('/api/save_palette',{palette:{name,bg,colors:colors.length?colors:[...document.querySelectorAll('#colorMap input')].map(i=>i.value)}});
+    savedPalettes=j.palettes; colTab='Palettes'; renderColour(); status(`Palette "${name}" saved.`)}catch(e){status(e.message)}
+}
+async function openColorways(){
+  const specs=[spec(),...palettes.filter(p=>p.colors.length&&p.name!==curPal.name),...savedPalettes.filter(p=>p.name!==curPal.name)].slice(0,9)
+    .map(p=>typeof p==='string'?p:{name:p.name,bg:p.bg,colors:p.colors});
+  status('Building colourways...');
+  try{const j=await api('/api/colorways',{placements:concrete(),palettes:specs,remap,background:bgValue()});colorways=j.colorways;
+    $('cwGrid').innerHTML=colorways.map((c,i)=>`<div class="cw"><div class="tile" style='background-image:url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(c.svg)}")'></div>
+      <div class="row" style="margin-top:4px"><b style="font-size:12px">${c.name}</b><span style="flex:1"></span><button data-use="${i}">Use</button><button data-save="${i}">Save</button></div></div>`).join('');
+    $('cwGrid').querySelectorAll('[data-use]').forEach(b=>b.onclick=()=>{const c=colorways[+b.dataset.use];
+      usePalette(typeof c.spec==='string'?{name:c.spec,bg:'',colors:[]}:c.spec);$('cwOverlay').style.display='none'});
+    $('cwGrid').querySelectorAll('[data-save]').forEach(b=>b.onclick=()=>saveColorway(+b.dataset.save));
+    $('cwOverlay').style.display='block'; status('');
+  }catch(e){status(e.message)}
+}
+async function saveColorway(i){
+  const c=colorways[i];
+  try{const j=await api('/api/save',{placements:concrete(),palette:c.spec,remap:i===0?remap:{},background:i===0?bgValue():'',name:$('saveName').value});
+    status('Saved: '+j.saved)}catch(e){status(e.message)}
+}
+$('palSave').onclick=savePalette; $('cwBtn').onclick=openColorways;
+$('cwClose').onclick=()=>$('cwOverlay').style.display='none';
+$('cwSaveAll').onclick=async()=>{for(let i=0;i<colorways.length;i++) await saveColorway(i); status(`Saved ${colorways.length} colourways.`)};
+$('gray').onchange=()=>$('ed').classList.toggle('gray',$('gray').checked);
 
 /* ---------- composition helpers ---------- */
 function renderGuides(){
@@ -776,7 +1048,7 @@ function renderGuides(){
 }
 async function checkColors(){
   $('colorOut').textContent='Checking...';
-  try{const j=await api('/api/colors',{placements:concrete(),palette,background:bgValue()});
+  try{const j=await api('/api/colors',{placements:concrete(),palette:spec(),remap,background:bgValue()});
     $('colorOut').innerHTML=j.shares.map(c=>`<div class="row" style="flex-wrap:nowrap"><span style="display:inline-block;width:14px;height:14px;border:1px solid #ccc;background:${c.hex}"></span>
       <span style="flex:1;height:8px;background:#eee;border-radius:4px"><span style="display:block;height:8px;border-radius:4px;width:${Math.round(c.share*100)}%;background:${c.hex};border:1px solid #bbb"></span></span>
       <span>${Math.round(c.share*100)}%</span></div>`).join('')+
