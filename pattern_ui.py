@@ -5,7 +5,9 @@ Pattern UI - local web editor for seamless vector patterns (PatternComposer).
 Load a folder of SVG motifs, pick a layout scheme (half-drop, brick, diamond,
 bouquets, vine, ditsy, toss, your own saved schemes, or scored auto layouts),
 then move, rotate, scale, flip, swap, add and delete motifs by hand on a live
-wrap-around tile. Colour: built-in and saved palettes, palettes from an image,
+wrap-around tile. Layers: each layer has its own motifs and its own free or
+block mode (e.g. a ditsy background layer under half-drop bouquets); show, lock,
+reorder, merge; saved SVGs keep one group per layer. Colour: built-in and saved palettes, palettes from an image,
 imported palettes (hex lists, QuiltFlow JSON, .ase, .gpl), OKLCH colour harmonies,
 recolouring by lightness with manual per-colour changes, a B/W check and a
 colourways sheet. Block mode: build one block (optionally mirror-symmetric)
@@ -23,6 +25,7 @@ Needs: numpy scipy pillow resvg-py (auto layouts, gap filling, PNG previews)
 
 Editor keys: drag = move, wheel = rotate, Shift+wheel = scale, Delete = remove,
 D = duplicate, F = flip, N = next motif of the same role, arrows = nudge,
+[ and ] = move the motif to the layer below / above,
 Ctrl+Z = undo, Ctrl+Y = redo.
 """
 
@@ -209,6 +212,32 @@ def auto(body):
                         for score, seed, placements, result in scored[:int(s['keep'])]]}
 
 
+def layered_tile_svg(layer_list, mapping, background, name):
+    """Tile SVG with one group per layer, bottom layer first."""
+    tw, th = pc.tile_dims(T)
+    all_motifs = {}
+    groups = []
+    for n, layer in enumerate(layer_list, start=1):
+        placements = [to_tuple(p) for p in layer.get('placements', [])]
+        instances, _ = pc.with_edge_copies(placements, T)
+        for m, _ in instances:
+            all_motifs[m.index] = m
+        label = (layer.get('name') or f'Layer {n}').replace('&', '&amp;').replace('<', '').replace('"', '')
+        uses = '\n'.join(f'<use href="#motif{m.index}" xlink:href="#motif{m.index}" '
+                          f'transform="{pc.fmt_matrix(mx)}"/>' for m, mx in instances)
+        groups.append(f'<g id="layer{n}_{pc.safe_name(label)}" inkscape:groupmode="layer" '
+                      f'inkscape:label="{label}">\n{uses}\n</g>')
+    used = sorted(all_motifs.values(), key=lambda m: m.index)
+    return (f'<svg xmlns="{pc.SVG_NS}" xmlns:xlink="{pc.XLINK_NS}" '
+            f'xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="{tw:g}" '
+            f'height="{th:g}" viewBox="0 0 {tw:g} {th:g}">\n<title>{name}</title>\n'
+            f'<defs>\n{pc.motif_defs(used, mapping)}\n'
+            f'<clipPath id="tile-clip"><rect width="{tw:g}" height="{th:g}"/></clipPath>\n'
+            f'</defs>\n<g clip-path="url(#tile-clip)">\n'
+            f'<rect id="background" width="{tw:g}" height="{th:g}" fill="{background}"/>\n'
+            + '\n'.join(groups) + '\n</g>\n</svg>\n')
+
+
 def save(body):
     placements = [to_tuple(p) for p in body.get('placements', [])]
     if not placements:
@@ -228,7 +257,11 @@ def save(body):
     while (out_dir / f'{name}.svg').exists():
         name, n = f'{stem}_{n}', n + 1
     instances, copies = pc.with_edge_copies(placements, T)
-    svg = pc.build_tile_svg(instances, used, mapping, bg, T, name)
+    layer_list = [l for l in body.get('layers') or [] if l.get('placements')]
+    if len(layer_list) > 1:
+        svg = layered_tile_svg(layer_list, mapping, bg, name)
+    else:
+        svg = pc.build_tile_svg(instances, used, mapping, bg, T, name)
     (out_dir / f'{name}.svg').write_text(svg, encoding='utf-8')
     (swatch_dir / f'{name}_swatch.svg').write_text(
         pc.build_swatch_svg(instances, used, mapping, bg, T, name), encoding='utf-8')
@@ -237,7 +270,9 @@ def save(body):
     png = pc.render_png(preview, preview_dir / f'{name}_preview_3k.png')
     (out_dir / f'{name}.layout.json').write_text(json.dumps(
         {'palette': palette, 'background': bg, 'colour_map': mapping, 'motif_folder': str(folder),
-         'placements': [dict(to_client(t), name=t[0].name) for t in placements]}, indent=1),
+         'placements': [dict(to_client(t), name=t[0].name) for t in placements],
+         'layers': [{'name': l.get('name'), 'placements': l.get('placements')} for l in layer_list]},
+        indent=1),
         encoding='utf-8')
     return {'saved': str(out_dir / f'{name}.svg'), 'png': bool(png), 'edge_copies': copies}
 
@@ -492,6 +527,10 @@ textarea{width:100%;height:70px;font:12px monospace;border:1px solid var(--line)
 #cwGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
 .cw .tile{height:240px;border-radius:6px;background-repeat:repeat;background-size:120px 120px;border:1px solid var(--line)}
 #ed.gray{filter:grayscale(1)}
+.layer{display:flex;align-items:center;gap:4px;padding:3px 4px;border:1px solid var(--line);border-radius:6px;margin:3px 0;cursor:pointer;font-size:12px}
+.layer.on{border-color:var(--accent);background:#eef6f3}
+.layer input[type=text]{flex:1;padding:3px 5px;font-size:12px}
+.layer label{display:flex;align-items:center;gap:1px;font-size:12px;cursor:pointer}
 summary{cursor:pointer;color:var(--muted);font-size:12px}
 .hint{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5}
 </style></head><body>
@@ -499,6 +538,14 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
   <h2>Motif folder</h2>
   <div class="row" style="flex-wrap:nowrap"><input type="text" id="folder" placeholder="D:\motifs\cranes"><button id="loadBtn">Load</button></div>
   <div id="skipped" class="muted"></div>
+
+  <h2>Layers <span class="muted" style="text-transform:none;letter-spacing:0">top layer first</span></h2>
+  <div id="layerList"></div>
+  <div class="row" style="margin-top:4px;gap:4px">
+    <button data-layer="add">+ Add</button><button data-layer="dup">Duplicate</button>
+    <button data-layer="up" title="Move layer up">&uarr;</button><button data-layer="down" title="Move layer down">&darr;</button>
+    <button data-layer="merge" title="Merge into the layer below">Merge down</button><button data-layer="del">Delete</button></div>
+  <label class="muted"><input type="checkbox" id="dimLayers" checked> dim other layers</label>
 
   <h2>Reference tile</h2>
   <div class="row"><input type="file" id="refFile" accept="image/*" style="max-width:100%"></div>
@@ -563,6 +610,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <button data-act="flip" title="F">Flip</button><button data-act="dup" title="D">Duplicate</button>
     <button data-act="next" title="N">Next motif</button><button data-act="front">To front</button>
     <button data-act="back">To back</button><button data-act="ring" title="Fillers around the selected motif by the golden angle">Golden ring</button>
+    <button id="toUp" title="Move to the layer above ( ] )">&uarr; layer</button><button id="toDown" title="Move to the layer below ( [ )">&darr; layer</button>
     <button data-act="del" title="Delete">Delete</button>
     <span id="selInfo" class="muted"></span>
     <span style="flex:1"></span>
@@ -644,29 +692,67 @@ let block={on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false};
 const LATTICES={halfdrop:'Half-drop',brick:'Brick',grid:'Grid'};
 const $=id=>document.getElementById(id), byId=id=>motifs.find(m=>m.id===id);
 const mod=v=>((v%T)+T)%T;
-function latticePoints(){
-  const L=[],w=T/block.nc,h=T/block.nr;
-  for(let c=0;c<block.nc;c++)for(let r=0;r<block.nr;r++){let x=c*w+w/2,y=r*h+h/2;
-    if(block.lattice==='halfdrop'&&c%2) y+=h/2;
-    if(block.lattice==='brick'&&r%2) x+=w/2;
+function latticePoints(b){
+  const L=[],w=T/b.nc,h=T/b.nr;
+  for(let c=0;c<b.nc;c++)for(let r=0;r<b.nr;r++){let x=c*w+w/2,y=r*h+h/2;
+    if(b.lattice==='halfdrop'&&c%2) y+=h/2;
+    if(b.lattice==='brick'&&r%2) x+=w/2;
     L.push([x,y]);}
   return L;
 }
-function blockItems(){
+function blockItems(items,b){
   const out=[];
-  P.forEach((p,i)=>{out.push({p,src:i,m:false});
-    if(block.mirror&&Math.abs(p.x)>4) out.push({p:{...p,x:-p.x,angle:-p.angle,flip:-p.flip},src:i,m:true});});
+  items.forEach((p,i)=>{out.push({p,src:i,m:false});
+    if(b.mirror&&Math.abs(p.x)>4) out.push({p:{...p,x:-p.x,angle:-p.angle,flip:-p.flip},src:i,m:true});});
   return out;
 }
-// Every motif actually drawn on the tile, with a link back to the editable item.
-function expand(){
-  if(!block.on) return P.map((p,i)=>({p,src:i,m:false}));
-  const k=block.k,out=[],items=blockItems();
-  for(const [lx,ly] of latticePoints()) for(const u of items){const q=u.p;
+// Every motif a layer actually draws on the tile, with a link back to the editable item.
+function expandLayer(items,b){
+  if(!b.on) return items.map((p,i)=>({p,src:i,m:false}));
+  const k=b.k,out=[],list=blockItems(items,b);
+  for(const [lx,ly] of latticePoints(b)) for(const u of list){const q=u.p;
     out.push({p:{id:q.id,x:mod(lx+q.x*k),y:mod(ly+q.y*k),s:q.s*k,angle:q.angle,flip:q.flip},src:u.src,m:u.m});}
   return out;
 }
-const concrete=()=>expand().map(e=>e.p);
+const expand=()=>expandLayer(P,block);
+
+/* ---------- layers: P and block always belong to the active layer ---------- */
+const newBlock=()=>({on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false});
+let layers=[{name:'Layer 1',visible:true,locked:false,P:[],block:newBlock()}], L=0;
+function commit(){layers[L].P=P;layers[L].block=block}
+const layerPlacements=l=>expandLayer(l.P,l.block).map(e=>e.p);
+// All visible layers, bottom to top - what gets saved, filled around and colour-checked.
+const concrete=()=>{commit();return layers.filter(l=>l.visible).flatMap(layerPlacements)};
+function switchLayer(i){commit();L=i;P=layers[L].P;block=layers[L].block;sel=-1;syncBlockUi();renderLayers();render()}
+function renderLayers(){
+  $('layerList').innerHTML=layers.map((l,i)=>i).reverse().map(i=>{const l=layers[i];
+    return `<div class="layer ${i===L?'on':''}" data-l="${i}">
+      <label title="Show"><input type="checkbox" data-vis="${i}" ${l.visible?'checked':''}>&#128065;</label>
+      <label title="Lock"><input type="checkbox" data-lock="${i}" ${l.locked?'checked':''}>&#128274;</label>
+      <input type="text" data-name="${i}" value="${l.name.replace(/"/g,'&quot;')}">
+      <span class="muted">${(i===L?P:l.P).length}${l.block.on?' &#9638;':''}</span></div>`}).join('');
+  $('layerList').querySelectorAll('.layer').forEach(d=>d.onclick=e=>{if(e.target.tagName!=='INPUT'||e.target.type==='text'){const i=+d.dataset.l;if(i!==L)switchLayer(i)}});
+  $('layerList').querySelectorAll('[data-vis]').forEach(c=>c.onchange=()=>{layers[+c.dataset.vis].visible=c.checked;render()});
+  $('layerList').querySelectorAll('[data-lock]').forEach(c=>c.onchange=()=>{layers[+c.dataset.lock].locked=c.checked;sel=-1;render()});
+  $('layerList').querySelectorAll('[data-name]').forEach(t=>t.onchange=()=>{layers[+t.dataset.name].name=t.value.trim()||'Layer'});
+}
+function layerAct(a){
+  snapshot(); commit();
+  if(a==='add'){layers.splice(L+1,0,{name:`Layer ${layers.length+1}`,visible:true,locked:false,P:[],block:newBlock()});L++}
+  if(a==='dup'){const c=JSON.parse(JSON.stringify(layers[L]));c.name+=' copy';layers.splice(L+1,0,c);L++}
+  if(a==='del'){if(layers.length===1){layers[0].P=[];}else{layers.splice(L,1);L=Math.max(0,L-1)}}
+  if(a==='up'&&L<layers.length-1){[layers[L],layers[L+1]]=[layers[L+1],layers[L]];L++}
+  if(a==='down'&&L>0){[layers[L],layers[L-1]]=[layers[L-1],layers[L]];L--}
+  if(a==='merge'&&L>0){const below=layers[L-1];   // baked copies of both layers end up in the lower one
+    below.P=[...layerPlacements(below),...layerPlacements(layers[L])];below.block=newBlock();layers.splice(L,1);L--}
+  P=layers[L].P;block=layers[L].block;sel=-1;syncBlockUi();renderLayers();render();
+}
+function moveToLayer(d){   // move the selected motif to the layer above (d=1) or below (d=-1)
+  const t=L+d; if(sel<0||!P[sel]||t<0||t>=layers.length){status('No layer there - add one first.');return}
+  if(block.on||layers[t].block.on){status('Bake block layers before moving motifs between them.');return}
+  snapshot(); const p=P.splice(sel,1)[0]; layers[t].P.push(p); commit(); sel=-1; renderLayers(); render();
+  status(`Moved to "${layers[t].name}".`);
+}
 
 /* ---------- settings ---------- */
 function sliders(list, el){
@@ -682,6 +768,7 @@ async function api(path, body){
   const j=await r.json(); if(!r.ok) throw new Error(j.error||'error'); return j;
 }
 const status=t=>$('status').textContent=t;
+const layerPayload=()=>{commit();return layers.filter(l=>l.visible).map(l=>({name:l.name,placements:layerPlacements(l)}))};
 function flags(){const roles={},upright={};motifs.forEach(m=>{roles[m.id]=m.role;upright[m.id]=m.upright});return {roles,upright}}
 
 /* ---------- loading ---------- */
@@ -692,7 +779,8 @@ async function load(){
     motifs=j.motifs; palettes=j.palettes; savedPalettes=j.saved_palettes; customSchemes=j.schemes; group='all';
     try{localStorage.setItem('pui_folder',j.folder)}catch(e){}
     $('skipped').textContent=j.skipped.length?'Skipped: '+j.skipped.join('; '):'';
-    P=[];sel=-1;hist=[];future=[];autoLayouts=[];
+    layers=[{name:'Layer 1',visible:true,locked:false,P:[],block:newBlock()}];L=0;block=layers[0].block;
+    P=[];sel=-1;hist=[];future=[];autoLayouts=[];renderLayers();syncBlockUi();
     renderMotifs(); renderSchemes(); renderColour(); await loadMarkup(); applyScheme();
     status(`${motifs.length} motifs loaded. Pick a scheme, then drag motifs to adjust.`);
   }catch(e){status(e.message)}
@@ -741,8 +829,8 @@ function angleFor(m, base){const s=settings();const lim=(m.upright?s.upright_rot
 function pool(role){const order={hero:['hero','medium','filler'],medium:['medium','hero','filler'],filler:['filler','medium','hero']}[role]||[role];
   for(const r of order){const p=motifs.filter(m=>m.role===r);if(p.length) return p}return []}
 function tdist(a,b){const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y);return Math.hypot(Math.min(dx,T-dx),Math.min(dy,T-dy))}
-const stateStr=()=>JSON.stringify({P,block});
-function restore(str){const o=JSON.parse(str);P=o.P;block=o.block;syncBlockUi()}
+const stateStr=()=>{commit();return JSON.stringify({layers,L})};
+function restore(str){const o=JSON.parse(str);layers=o.layers;L=o.L;P=layers[L].P;block=layers[L].block;syncBlockUi();renderLayers()}
 function snapshot(){hist.push(stateStr());if(hist.length>200)hist.shift();future=[]}
 
 function applyScheme(){
@@ -774,8 +862,16 @@ const OFFS=[];for(const dy of [-T,0,T])for(const dx of [-T,0,T])OFFS.push([dx,dy
 function render(){
   const ctx=parseFloat($('ctx').value)*T;
   $('ed').setAttribute('viewBox',`${-ctx} ${-ctx} ${T+2*ctx} ${T+2*ctx}`);
-  $('inst').innerHTML=expand().map(e=>OFFS.map(([dx,dy])=>
-    `<use href="#m${e.p.id}" xlink:href="#m${e.p.id}" data-i="${e.src}" data-m="${e.m?1:0}" transform="${xform(e.p,dx,dy)}"/>`).join('')).join('');
+  commit();
+  const dim=$('dimLayers').checked;
+  $('inst').innerHTML=layers.map((l,li)=>{
+    if(!l.visible) return '';
+    const live=li===L&&!l.locked;
+    const uses=expandLayer(l.P,l.block).map(e=>OFFS.map(([dx,dy])=>
+      `<use href="#m${e.p.id}" xlink:href="#m${e.p.id}" ${live?`data-i="${e.src}" data-m="${e.m?1:0}"`:''} transform="${xform(e.p,dx,dy)}"/>`).join('')).join('');
+    return `<g ${live?'':'pointer-events="none"'} opacity="${dim&&li!==L?0.35:1}">${uses}</g>`;}).join('');
+  if($('layerList')) for(const el of $('layerList').querySelectorAll('.layer .muted')){const i=+el.parentElement.dataset.l;
+    el.innerHTML=layers[i].P.length+(layers[i].block.on?' &#9638;':'')}
   const big=`M${-T} ${-T}H${2*T}V${2*T}H${-T}Z`, hole=`M0 0V${T}H${T}V0Z`;
   $('fadeMask').setAttribute('d',big+hole); $('fadeMask').style.display=$('fade').checked?'':'none';
   renderRef(); renderSel();
@@ -852,6 +948,7 @@ document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&k==='z'){e.preventDefault();e.shiftKey?redo():undo();return}
   if((e.ctrlKey||e.metaKey)&&k==='y'){e.preventDefault();redo();return}
   if(k==='delete'||k==='backspace'){e.preventDefault();act('del')}
+  else if(k===']') moveToLayer(1); else if(k==='[') moveToLayer(-1);
   else if(k==='d') act('dup'); else if(k==='f') act('flip'); else if(k==='n') act('next');
   else if(k.startsWith('arrow')&&sel>=0){e.preventDefault();snapshot();const d=e.shiftKey?25:5,p=P[sel];
     if(k==='arrowleft')p.x-=d;if(k==='arrowright')p.x+=d;if(k==='arrowup')p.y-=d;if(k==='arrowdown')p.y+=d;
@@ -862,8 +959,10 @@ document.addEventListener('keydown',e=>{
 async function fillGaps(){
   if(block.on) bake();
   status('Filling gaps...');
-  try{const j=await api('/api/fill',{placements:P,settings:settings(),...flags()});
-    snapshot(); P=j.placements; sel=-1; render(); status(`Added ${j.added} fillers. ${j.note||''}`)}catch(e){status(e.message)}
+  const all=concrete();
+  try{const j=await api('/api/fill',{placements:all,settings:settings(),...flags()});
+    snapshot(); P.push(...j.placements.slice(all.length)); sel=-1; render(); renderLayers();
+    status(`Added ${j.added} fillers to "${layers[L].name}". ${j.note||''}`)}catch(e){status(e.message)}
 }
 async function runAuto(){
   $('autoBtn').disabled=true; status('Auto: trying layouts (a few seconds each)...');
@@ -882,7 +981,7 @@ function renderStrip(){
 }
 async function savePattern(){
   status('Saving...');
-  try{const j=await api('/api/save',{placements:concrete(),palette:spec(),remap,background:bgValue(),name:$('saveName').value});
+  try{const j=await api('/api/save',{placements:concrete(),layers:layerPayload(),palette:spec(),remap,background:bgValue(),name:$('saveName').value});
     status('Saved: '+j.saved+(j.png?'':' (PNG preview needs resvg-py)'))}catch(e){status(e.message)}
 }
 async function saveScheme(){
@@ -1030,7 +1129,7 @@ async function openColorways(){
 }
 async function saveColorway(i){
   const c=colorways[i];
-  try{const j=await api('/api/save',{placements:concrete(),palette:c.spec,remap:i===0?remap:{},background:i===0?bgValue():'',name:$('saveName').value});
+  try{const j=await api('/api/save',{placements:concrete(),layers:layerPayload(),palette:c.spec,remap:i===0?remap:{},background:i===0?bgValue():'',name:$('saveName').value});
     status('Saved: '+j.saved)}catch(e){status(e.message)}
 }
 $('palSave').onclick=savePalette; $('cwBtn').onclick=openColorways;
@@ -1089,7 +1188,7 @@ function enterBlock(){
   status('Block mode: edit one block - every copy follows. Click motif pictures to add them to the block, turn on mirror for symmetry.');
 }
 function bake(){
-  if(!block.on) return; snapshot(); P=concrete(); block.on=false; sel=-1; syncBlockUi(); render();
+  if(!block.on) return; snapshot(); P=expand().map(e=>e.p); block.on=false; sel=-1; syncBlockUi(); render();
   status('Blocks baked into free motifs - you can now edit every copy on its own.');
 }
 $('blockOn').onchange=()=>{$('blockOn').checked?enterBlock():bake()};
@@ -1100,6 +1199,9 @@ $('bK').oninput=e=>{block.k=+e.target.value;$('v_bK').textContent=block.k.toFixe
 syncBlockUi();
 
 /* ---------- wiring ---------- */
+document.querySelectorAll('[data-layer]').forEach(b=>b.onclick=()=>layerAct(b.dataset.layer));
+$('dimLayers').onchange=render; $('toUp').onclick=()=>moveToLayer(1); $('toDown').onclick=()=>moveToLayer(-1);
+renderLayers();
 sliders(MAIN,'slidersMain'); sliders(AUTO,'slidersAuto');
 $('loadBtn').onclick=load; $('folder').addEventListener('keydown',e=>{if(e.key==='Enter')load()});
 $('applyBtn').onclick=applyScheme; $('autoBtn').onclick=runAuto; $('fillBtn').onclick=fillGaps;
