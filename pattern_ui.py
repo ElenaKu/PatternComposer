@@ -1066,7 +1066,9 @@ function renderNow(){
   const gpu=GL.active();
   $('glc').style.display=gpu?'block':'none';
   for(const id of ['bgRect','refLayer','inst']) $(id).style.display=gpu?'none':'';
-  if(gpu){GL.draw(ctx); layerCache=[]; $('inst').innerHTML='';
+  if(gpu){
+    try{GL.draw(ctx)}catch(e){console.error(e);GL.disable();status('GPU preview failed on this computer - showing plain SVG.');return renderNow()}
+    layerCache=[]; $('inst').innerHTML='';
     const big=`M${-T} ${-T}H${2*T}V${2*T}H${-T}Z`, hole=`M0 0V${T}H${T}V0Z`;
     $('fadeMask').setAttribute('d',big+hole); $('fadeMask').style.display=$('fade').checked?'':'none';
     if($('layerList')) for(const el of $('layerList').querySelectorAll('.layer .muted')){const i=+el.parentElement.dataset.l;
@@ -1466,13 +1468,17 @@ const GL=(()=>{
     return t;
   }
   async function setMotifs(list,bgHex){
+    try{await build(list,bgHex)}catch(e){console.error('GPU preview off:',e);ok=false}
+  }
+  async function build(list,bgHex){
     ok=false; bg=hexRgb(bgHex);
     if(!list.length||list.some(m=>!m.png)||!init()) return;
     const imgs=await Promise.all(list.map(m=>loadImg('data:image/png;base64,'+m.png)));
     if(imgs.some(x=>!x)) return;
     // shelf packing into one atlas; shrink the cells if the motifs do not fit
-    const max=Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE),8192);
-    let cell=Math.min(480,Math.floor(max/Math.ceil(Math.sqrt(imgs.length))));
+    const limit=Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE),4096);
+    let cell=Math.min(384,Math.floor(limit/Math.ceil(Math.sqrt(imgs.length)))-2);
+    const max=Math.min(limit,Math.ceil(Math.sqrt(imgs.length))*(cell+2)+2);
     let place;
     for(;cell>=32;cell=Math.floor(cell*0.85)){
       place=[];let x=1,y=1,row=0,fits=true;
@@ -1489,7 +1495,9 @@ const GL=(()=>{
       const a=document.createElement('canvas');a.width=64;a.height=64;const ag=a.getContext('2d');   // small alpha map for picking
       ag.drawImage(imgs[i],0,0,64,64);alpha[m.id]=ag.getImageData(0,0,64,64).data;});
     if(atlasTex) gl.deleteTexture(atlasTex);
-    atlasTex=texFrom(c); ok=true; refSrc=null; refTex=null;
+    atlasTex=texFrom(c);
+    if(gl.getError()!==gl.NO_ERROR||gl.isContextLost()) throw new Error('texture upload failed');
+    ok=true; refSrc=null; refTex=null;
     if(refImg) await setRef(refImg);
   }
   let refSrc=null;
@@ -1547,7 +1555,8 @@ const GL=(()=>{
       return {src,m};}
     return null;
   }
-  return {setMotifs,setRef,draw,pick,active:()=>ok&&$('fast').checked};
+  cv.addEventListener('webglcontextlost',e=>{e.preventDefault();ok=false;render()});
+  return {setMotifs,setRef,draw,pick,disable:()=>{ok=false},active:()=>ok&&$('fast').checked};
 })();
 
 /* ---------- shapes ---------- */
