@@ -170,10 +170,46 @@ def markup(body):
     motifs = STATE['motifs']
     bg, mapping = palette_of(body.get('palette'), body.get('background'), motifs, body.get('remap'))
     originals = sorted({c for m in motifs for c in m.colors}, key=pc.lightness)
+    raster = bool(body.get('raster')) and pc.render_rgba(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>') is not None
+    out = []
+    for m in motifs:
+        if raster:
+            png = motif_png(m, mapping)
+            if png:
+                out.append({'id': m.index, 'png': png})
+                continue
+        out.append({'id': m.index, 'defs': pc.recolor_markup(m.defs_markup, mapping) if m.defs_markup else '',
+                    'body': pc.recolor_markup(m.body_markup, mapping)})
     return {'bg': bg, 'colors': [{'orig': c, 'now': mapping.get(c, c)} for c in originals],
-            'motifs': [
-        {'id': m.index, 'defs': pc.recolor_markup(m.defs_markup, mapping) if m.defs_markup else '',
-         'body': pc.recolor_markup(m.body_markup, mapping)} for m in motifs]}
+            'motifs': out}
+
+
+_png_cache = {}
+
+
+def motif_png(m, mapping, px=480):
+    """Motif rendered once to a PNG (base64) - fast to draw thousands of times in the editor."""
+    import base64
+    import io
+    own = tuple(sorted((c, mapping.get(c, c)) for c in m.colors))
+    key = (str(m.path), m.index, own)
+    if key in _png_cache:
+        return _png_cache[key]
+    x0, y0, x1, y1 = m.bbox
+    w, h = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6)
+    k = px / max(w, h)
+    svg = (f'<svg xmlns="{pc.SVG_NS}" xmlns:xlink="{pc.XLINK_NS}" width="{max(1, round(w * k))}" '
+           f'height="{max(1, round(h * k))}" viewBox="{x0:g} {y0:g} {w:g} {h:g}">'
+           f'<defs>{pc.recolor_markup(m.defs_markup, mapping) if m.defs_markup else ""}</defs>'
+           f'{pc.recolor_markup(m.body_markup, mapping)}</svg>')
+    image = pc.render_rgba(svg)
+    if image is None:
+        return None
+    buf = io.BytesIO()
+    image.save(buf, format='PNG', optimize=False)
+    _png_cache[key] = base64.b64encode(buf.getvalue()).decode('ascii')
+    return _png_cache[key]
 
 
 def fill(body):
@@ -221,24 +257,55 @@ def auto(body):
                         for score, seed, placements, result in scored[:int(s['keep'])]]}
 
 
+ORDER_KEYS = {
+    'lower': lambda kx, ky, r: (ky, kx, r),      # lower blocks overlap the ones above them
+    'upper': lambda kx, ky, r: (-ky, kx, r),
+    'right': lambda kx, ky, r: (kx, ky, r),
+    'left': lambda kx, ky, r: (-kx, ky, r),
+}
+
+
+def layer_instances(layer):
+    """Instances of one layer incl. edge copies, stacked by the layer's overlap order.
+
+    Block layers send each motif's block anchor (kx, ky) and its rank inside the
+    block, so whole blocks overlap each other consistently - also across the tile
+    edge - while the motifs inside a block keep their own order.
+    """
+    key = ORDER_KEYS.get(layer.get('order'))
+    items = []
+    for n, p in enumerate(layer.get('placements', [])):
+        t = to_tuple(p)
+        base = pc.instance_matrix(*t)
+        for motif, mx in pc.with_edge_copies([t], T)[0]:
+            sx, sy = mx[4] - base[4], mx[5] - base[5]
+            k = (key(float(p.get('kx', p['x'])) + sx, float(p.get('ky', p['y'])) + sy,
+                     int(p.get('r', n))) if key else n)
+            items.append((k, n, motif, mx))
+    if key:
+        items.sort(key=lambda item: (item[0], item[1]))
+    return [(motif, mx) for _, _, motif, mx in items]
+
+
 def layered_tile_svg(layer_list, mapping, background, name):
     """Tile SVG with one group per layer, bottom layer first."""
     tw, th = pc.tile_dims(T)
     all_motifs = {}
     groups = []
     for n, layer in enumerate(layer_list, start=1):
-        placements = [to_tuple(p) for p in layer.get('placements', [])]
-        instances, _ = pc.with_edge_copies(placements, T)
+        instances = layer_instances(layer)
         for m, _ in instances:
             all_motifs[m.index] = m
         label = (layer.get('name') or f'Layer {n}').replace('&', '&amp;').replace('<', '').replace('"', '')
         uses = '\n'.join(f'<use href="#motif{m.index}" xlink:href="#motif{m.index}" '
                           f'transform="{pc.fmt_matrix(mx)}"/>' for m, mx in instances)
-        groups.append(f'<g id="layer{n}_{pc.safe_name(label)}" inkscape:groupmode="layer" '
+        groups.append(f'<g id="layer{n}_{pc.safe_name(label)}" '
+                      f'xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+                      f'inkscape:groupmode="layer" '
                       f'inkscape:label="{label}">\n{uses}\n</g>')
     used = sorted(all_motifs.values(), key=lambda m: m.index)
     return (f'<svg xmlns="{pc.SVG_NS}" xmlns:xlink="{pc.XLINK_NS}" '
-            f'xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="{tw:g}" '
+            f'width="{tw:g}" '
             f'height="{th:g}" viewBox="0 0 {tw:g} {th:g}">\n<title>{name}</title>\n'
             f'<defs>\n{pc.motif_defs(used, mapping)}\n'
             f'<clipPath id="tile-clip"><rect width="{tw:g}" height="{th:g}"/></clipPath>\n'
@@ -267,7 +334,7 @@ def save(body):
         name, n = f'{stem}_{n}', n + 1
     instances, copies = pc.with_edge_copies(placements, T)
     layer_list = [l for l in body.get('layers') or [] if l.get('placements')]
-    if len(layer_list) > 1:
+    if layer_list:
         svg = layered_tile_svg(layer_list, mapping, bg, name)
     else:
         svg = pc.build_tile_svg(instances, used, mapping, bg, T, name)
@@ -354,8 +421,10 @@ def colorways(body):
         first = i == 0   # the current palette keeps your manual colour changes and background
         bg, mapping = palette_of(spec, body.get('background', '') if first else '', STATE['motifs'],
                                  body.get('remap') if first else None)
-        out.append({'name': palette_name(spec), 'spec': spec, 'bg': bg,
-                    'svg': pc.build_tile_svg(instances, used, mapping, bg, T, palette_name(spec))})
+        layer_list = [l for l in body.get('layers') or [] if l.get('placements')]
+        svg = (layered_tile_svg(layer_list, mapping, bg, palette_name(spec)) if layer_list
+               else pc.build_tile_svg(instances, used, mapping, bg, T, palette_name(spec)))
+        out.append({'name': palette_name(spec), 'spec': spec, 'bg': bg, 'svg': svg})
     return {'colorways': out}
 
 
@@ -702,6 +771,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <span class="muted">Rows</span><input type="range" id="bNr" min="1" max="6" step="1" value="1" style="width:70px"><span id="v_bNr" class="muted">1</span>
     <span class="muted">Block scale</span><input type="range" id="bK" min="0.4" max="1.8" step="0.02" value="1" style="width:90px"><span id="v_bK" class="muted">1</span>
     <label class="muted" title="Left half mirrors the right half"><input type="checkbox" id="bMirror"> mirror</label>
+    <span class="muted">Overlap</span><div id="orderTabs" class="tabs"></div>
     <button id="bakeBtn" title="Turn the repeated blocks into free motifs">Bake</button>
   </div>
   <div class="bar">
@@ -716,6 +786,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <span style="flex:1"></span>
     <span class="muted">Context</span><input type="range" id="ctx" min="0.1" max="1" step="0.05" value="0.5" style="width:90px">
     <label class="muted"><input type="checkbox" id="fade" checked> fade repeats</label>
+    <label class="muted" title="Draw motifs as pictures while editing - much faster for detailed motifs; saved files stay vector"><input type="checkbox" id="fast" checked> fast preview</label>
   </div>
   <div id="edBox"><svg id="ed" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
     <defs id="mdefs"></defs>
@@ -810,14 +881,27 @@ function blockItems(items,b){
 function expandLayer(items,b){
   if(!b.on) return items.map((p,i)=>({p,src:i,m:false}));
   const k=b.k,out=[],list=blockItems(items,b);
-  for(const [lx,ly] of latticePoints(b)) for(const u of list){const q=u.p;
-    out.push({p:{id:q.id,x:mod(lx+q.x*k),y:mod(ly+q.y*k),s:q.s*k,angle:q.angle,flip:q.flip},src:u.src,m:u.m});}
+  for(const [lx,ly] of latticePoints(b)) list.forEach((u,r)=>{const q=u.p;
+    const x=mod(lx+q.x*k), y=mod(ly+q.y*k);
+    // kx, ky: this copy's block anchor (wrapped together with the motif); r: rank inside the block
+    out.push({p:{id:q.id,x,y,s:q.s*k,angle:q.angle,flip:q.flip},src:u.src,m:u.m,kx:x-q.x*k,ky:y-q.y*k,r});});
+  return out;
+}
+const ORDERS={lower:'Lower on top',upper:'Upper on top',right:'Right on top',left:'Left on top'};
+const ORDER_FN={lower:(a,b)=>a.ky-b.ky||a.kx-b.kx||a.r-b.r, upper:(a,b)=>b.ky-a.ky||a.kx-b.kx||a.r-b.r,
+  right:(a,b)=>a.kx-b.kx||a.ky-b.ky||a.r-b.r, left:(a,b)=>b.kx-a.kx||a.ky-b.ky||a.r-b.r};
+// Every drawn copy (incl. the 3x3 repeats) in stacking order.
+function drawList(l){
+  const ex=expandLayer(l.P,l.block), out=[];
+  ex.forEach((e,n)=>OFFS.forEach(([dx,dy])=>out.push({e,dx,dy,n,kx:(e.kx??e.p.x)+dx,ky:(e.ky??e.p.y)+dy,r:e.r??n})));
+  const fn=l.block.on&&ORDER_FN[l.block.order||'lower'];
+  if(fn) out.sort((a,b)=>fn(a,b)||a.n-b.n); else out.sort((a,b)=>a.n-b.n);
   return out;
 }
 const expand=()=>expandLayer(P,block);
 
 /* ---------- layers: P and block always belong to the active layer ---------- */
-const newBlock=()=>({on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false});
+const newBlock=()=>({on:false,lattice:'halfdrop',nc:2,nr:1,k:1,mirror:false,order:'lower'});
 let layers=[{name:'Layer 1',visible:true,locked:false,P:[],block:newBlock()}], L=0;
 function commit(){layers[L].P=P;layers[L].block=block}
 const layerPlacements=l=>expandLayer(l.P,l.block).map(e=>e.p);
@@ -868,7 +952,9 @@ async function api(path, body){
   const j=await r.json(); if(!r.ok) throw new Error(j.error||'error'); return j;
 }
 const status=t=>$('status').textContent=t;
-const layerPayload=()=>{commit();return layers.filter(l=>l.visible).map(l=>({name:l.name,placements:layerPlacements(l)}))};
+const layerPayload=()=>{commit();return layers.filter(l=>l.visible).map(l=>({name:l.name,
+  order:l.block.on?(l.block.order||'lower'):null,
+  placements:expandLayer(l.P,l.block).map((e,n)=>({...e.p,kx:e.kx??e.p.x,ky:e.ky??e.p.y,r:e.r??n}))}))};
 function flags(){const roles={},upright={};motifs.forEach(m=>{roles[m.id]=m.role;upright[m.id]=m.upright});return {roles,upright}}
 
 /* ---------- loading ---------- */
@@ -886,8 +972,12 @@ async function load(){
   }catch(e){status(e.message)}
 }
 async function loadMarkup(){
-  const j=await api('/api/markup',{palette:spec(),remap,background:bgValue()});
-  $('mdefs').innerHTML=j.motifs.map(m=>`${m.defs}<g id="m${m.id}">${m.body}</g>`).join('');
+  const j=await api('/api/markup',{palette:spec(),remap,background:bgValue(),raster:$('fast').checked});
+  $('mdefs').innerHTML=j.motifs.map(m=>{
+    if(m.png){const d=byId(m.id);   // raster stand-in, same coordinates as the vector motif
+      return `<g id="m${m.id}"><image href="data:image/png;base64,${m.png}" x="${d.cx-d.w/2}" y="${d.cy-d.h/2}" width="${d.w}" height="${d.h}" preserveAspectRatio="none"/></g>`}
+    return `${m.defs}<g id="m${m.id}">${m.body}</g>`}).join('');
+  layerCache=[];
   $('bgRect').setAttribute('fill',j.bg); if(!$('customBg').checked) $('bgColor').value=toHex(j.bg);
   renderColorMap(j.colors); renderCurPal(); render(); renderStrip();
 }
@@ -959,17 +1049,32 @@ function addMotif(id,size){
 function xform(p,dx,dy){const m=byId(p.id);const k=p.s*T/Math.max(m.w,m.h);
   return `translate(${p.x+dx} ${p.y+dy}) rotate(${p.angle}) scale(${k*p.flip} ${k}) translate(${-m.cx} ${-m.cy})`}
 const OFFS=[];for(const dy of [-T,0,T])for(const dx of [-T,0,T])OFFS.push([dx,dy]);
+// Redraws are batched to one per animation frame; each layer is rebuilt only when it
+// changed, and copies outside the visible area are skipped.
+let framePending=false, layerCache=[];
 function render(){
+  if(framePending) return; framePending=true;
+  requestAnimationFrame(()=>{framePending=false; renderNow()});
+}
+function renderNow(){
   const ctx=parseFloat($('ctx').value)*T;
   $('ed').setAttribute('viewBox',`${-ctx} ${-ctx} ${T+2*ctx} ${T+2*ctx}`);
   commit();
-  const dim=$('dimLayers').checked;
-  $('inst').innerHTML=layers.map((l,li)=>{
-    if(!l.visible) return '';
-    const live=li===L&&!l.locked;
-    const uses=expandLayer(l.P,l.block).map(e=>OFFS.map(([dx,dy])=>
-      `<use href="#m${e.p.id}" xlink:href="#m${e.p.id}" ${live?`data-i="${e.src}" data-m="${e.m?1:0}"`:''} transform="${xform(e.p,dx,dy)}"/>`).join('')).join('');
-    return `<g ${live?'':'pointer-events="none"'} opacity="${dim&&li!==L?0.35:1}">${uses}</g>`;}).join('');
+  const dim=$('dimLayers').checked, inst=$('inst');
+  while(inst.children.length<layers.length) inst.appendChild(document.createElementNS('http://www.w3.org/2000/svg','g'));
+  while(inst.children.length>layers.length) inst.lastChild.remove();
+  layers.forEach((l,li)=>{
+    const live=li===L&&!l.locked, g=inst.children[li];
+    const key=JSON.stringify([l.visible,live,dim&&li!==L,ctx,l.P,l.block]);
+    if(layerCache[li]===key) return;
+    layerCache[li]=key;
+    g.setAttribute('opacity',dim&&li!==L?0.35:1);
+    if(live) g.removeAttribute('pointer-events'); else g.setAttribute('pointer-events','none');
+    if(!l.visible){g.innerHTML='';return}
+    g.innerHTML=drawList(l).filter(({e,dx,dy})=>{const r=e.p.s*T*0.75,x=e.p.x+dx,y=e.p.y+dy;
+        return x+r>-ctx&&x-r<T+ctx&&y+r>-ctx&&y-r<T+ctx})
+      .map(({e,dx,dy})=>`<use href="#m${e.p.id}" ${live?`data-i="${e.src}" data-m="${e.m?1:0}"`:''} transform="${xform(e.p,dx,dy)}"/>`).join('');
+  });
   if($('layerList')) for(const el of $('layerList').querySelectorAll('.layer .muted')){const i=+el.parentElement.dataset.l;
     el.innerHTML=layers[i].P.length+(layers[i].block.on?' &#9638;':'')}
   const big=`M${-T} ${-T}H${2*T}V${2*T}H${-T}Z`, hole=`M0 0V${T}H${T}V0Z`;
@@ -1218,7 +1323,7 @@ async function openColorways(){
   const specs=[spec(),...palettes.filter(p=>p.colors.length&&p.name!==curPal.name),...savedPalettes.filter(p=>p.name!==curPal.name)].slice(0,9)
     .map(p=>typeof p==='string'?p:{name:p.name,bg:p.bg,colors:p.colors});
   status('Building colourways...');
-  try{const j=await api('/api/colorways',{placements:concrete(),palettes:specs,remap,background:bgValue()});colorways=j.colorways;
+  try{const j=await api('/api/colorways',{placements:concrete(),layers:layerPayload(),palettes:specs,remap,background:bgValue()});colorways=j.colorways;
     $('cwGrid').innerHTML=colorways.map((c,i)=>`<div class="cw"><div class="tile" style='background-image:url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(c.svg)}")'></div>
       <div class="row" style="margin-top:4px"><b style="font-size:12px">${c.name}</b><span style="flex:1"></span><button data-use="${i}">Use</button><button data-save="${i}">Save</button></div></div>`).join('');
     $('cwGrid').querySelectorAll('[data-use]').forEach(b=>b.onclick=()=>{const c=colorways[+b.dataset.use];
@@ -1271,6 +1376,8 @@ function syncBlockUi(){
   $('bNc').value=block.nc; $('v_bNc').textContent=block.nc;
   $('bNr').value=block.nr; $('v_bNr').textContent=block.nr;
   $('bK').value=block.k; $('v_bK').textContent=(+block.k).toFixed(2);
+  $('orderTabs').innerHTML=Object.entries(ORDERS).map(([k,l])=>`<button class="${k===(block.order||'lower')?'on':''}" data-o="${k}">${l}</button>`).join('');
+  $('orderTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{snapshot();block.order=b.dataset.o;syncBlockUi();render()});
   $('latTabs').innerHTML=Object.entries(LATTICES).map(([k,l])=>`<button class="${k===block.lattice?'on':''}" data-l="${k}">${l}</button>`).join('');
   $('latTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{snapshot();block.lattice=b.dataset.l;fixLattice();syncBlockUi();render()});
 }
@@ -1342,7 +1449,7 @@ $('applyBtn').onclick=applyScheme; $('autoBtn').onclick=runAuto; $('fillBtn').on
 $('clearBtn').onclick=()=>{snapshot();P=[];sel=-1;render()};
 $('undoBtn').onclick=undo; $('redoBtn').onclick=redo;
 $('saveBtn').onclick=savePattern; $('schemeSaveBtn').onclick=saveScheme;
-$('ctx').oninput=render; $('fade').onchange=render;
+$('ctx').oninput=render; $('fast').onchange=loadMarkup; $('fade').onchange=render;
 $('bgColor').onchange=()=>{$('customBg').checked=true;loadMarkup()}; $('customBg').onchange=loadMarkup;
 $('refFile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
   r.onload=()=>{refImg=r.result;renderRef();status('Reference tile shown under the motifs.')};r.readAsDataURL(f)};
