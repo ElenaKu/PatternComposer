@@ -5,7 +5,8 @@ Pattern UI - local web editor for seamless vector patterns (PatternComposer).
 Load a folder of SVG motifs, pick a layout scheme (half-drop, brick, diamond,
 bouquets, vine, ditsy, toss, your own saved schemes, or scored auto layouts),
 then move, rotate, scale, flip, swap, add and delete motifs by hand on a live
-wrap-around tile. Layers: each layer has its own motifs and its own free or
+wrap-around tile. Shapes: circles, squares, triangles, stars, hearts, lines,
+waves and more, filled or outlined, any colour, added as motifs. Layers: each layer has its own motifs and its own free or
 block mode (e.g. a ditsy background layer under half-drop bouquets); show, lock,
 reorder, merge; saved SVGs keep one group per layer. Colour: built-in and saved palettes, palettes from an image,
 imported palettes (hex lists, QuiltFlow JSON, .ase, .gpl), OKLCH colour harmonies,
@@ -43,6 +44,7 @@ import PatternComposer as pc
 HOST, PORT = '127.0.0.1', 8769
 SCHEME_DIR = Path(__file__).resolve().parent / 'schemes'
 PALETTE_DIR = Path(__file__).resolve().parent / 'palettes'
+SHAPE_DIR = Path(__file__).resolve().parent / 'shape_cache'
 T = pc.TILE_SIZE
 
 STATE = {'folder': None, 'motifs': [], 'preload': ''}
@@ -121,6 +123,17 @@ def needs_renderer():
 # --------------------------------------------------------------------------
 # Actions
 # --------------------------------------------------------------------------
+def motif_info(m):
+    folder = STATE['folder']
+    try:
+        group = str(m.path.parent.relative_to(folder)).replace('\\', '/')
+    except ValueError:
+        group = 'shapes'
+    return {'id': m.index, 'name': m.name, 'role': m.role, 'upright': m.upright,
+            'w': m.width, 'h': m.height,
+            'cx': (m.bbox[0] + m.bbox[2]) / 2, 'cy': (m.bbox[1] + m.bbox[3]) / 2, 'group': group}
+
+
 def load_folder(body):
     folder = Path(body.get('folder', '').strip().strip('"\''))
     if not folder.is_dir():
@@ -144,11 +157,7 @@ def load_folder(body):
     STATE.update(folder=folder, motifs=motifs)
     return {
         'folder': str(folder), 'skipped': skipped, 'tile': T,
-        'motifs': [{'id': m.index, 'name': m.name, 'role': m.role, 'upright': m.upright,
-                    'w': m.width, 'h': m.height,
-                    'cx': (m.bbox[0] + m.bbox[2]) / 2, 'cy': (m.bbox[1] + m.bbox[3]) / 2,
-                    'group': str(m.path.parent.relative_to(folder)).replace('\\', '/')}
-                   for m in motifs],
+        'motifs': [motif_info(m) for m in motifs],
         'palettes': [{'name': 'original', 'bg': '', 'colors': []}]
                     + [{'name': n, 'bg': bg, 'colors': c} for n, (bg, c) in pc.PALETTES.items()],
         'saved_palettes': list_palettes(),
@@ -377,6 +386,86 @@ def extract_palette(body):
     return {'bg': hexes[0], 'colors': hexes[1:] or hexes}
 
 
+def _poly(points):
+    return ' '.join(f'{x:.2f},{y:.2f}' for x, y in points)
+
+
+def _star(n, outer, inner, rot=-90):
+    import math
+    pts = []
+    for i in range(n * 2):
+        r = outer if i % 2 == 0 else inner
+        a = math.radians(rot + i * 180 / n)
+        pts.append((50 + r * math.cos(a), 50 + r * math.sin(a)))
+    return pts
+
+
+def shape_geometry(shape):
+    """(svg element, stroke_only) for a shape drawn in a 100 x 100 box."""
+    import math
+    hexagon = [(50 + 46 * math.cos(math.radians(a)), 50 + 46 * math.sin(math.radians(a)))
+               for a in range(-90, 270, 60)]
+    shapes = {
+        'circle': ('<circle cx="50" cy="50" r="45"/>', False),
+        'square': ('<rect x="7" y="7" width="86" height="86"/>', False),
+        'rounded': ('<rect x="7" y="7" width="86" height="86" rx="20"/>', False),
+        'triangle': (f'<polygon points="{_poly([(50, 6), (95, 88), (5, 88)])}"/>', False),
+        'diamond': (f'<polygon points="{_poly([(50, 4), (90, 50), (50, 96), (10, 50)])}"/>', False),
+        'hexagon': (f'<polygon points="{_poly(hexagon)}"/>', False),
+        'star': (f'<polygon points="{_poly(_star(5, 47, 19))}"/>', False),
+        'burst': (f'<polygon points="{_poly(_star(12, 47, 30))}"/>', False),
+        'heart': ('<path d="M50 88 C20 66 5 50 5 32 C5 17 17 7 30 7 C40 7 47 13 50 21 '
+                  'C53 13 60 7 70 7 C83 7 95 17 95 32 C95 50 80 66 50 88 Z"/>', False),
+        'half': ('<path d="M5 70 A45 45 0 0 1 95 70 Z"/>', False),
+        'drop': ('<path d="M50 5 C66 30 82 46 82 63 C82 81 68 95 50 95 C32 95 18 81 18 63 '
+                 'C18 46 34 30 50 5 Z"/>', False),
+        'plus': (f'<polygon points="{_poly([(38, 6), (62, 6), (62, 38), (94, 38), (94, 62), (62, 62), (62, 94), (38, 94), (38, 62), (6, 62), (6, 38), (38, 38)])}"/>', False),
+        'line': ('<line x1="6" y1="50" x2="94" y2="50" stroke-linecap="round"/>', True),
+        'wave': ('<path d="M4 50 C16 30 28 30 40 50 S64 70 76 50 S92 34 96 42" '
+                 'stroke-linecap="round"/>', True),
+        'arc': ('<path d="M10 70 A42 42 0 0 1 90 70" stroke-linecap="round"/>', True),
+        'chevron': ('<polyline points="8,30 50,70 92,30" stroke-linecap="round" '
+                    'stroke-linejoin="round"/>', True),
+    }
+    if shape not in shapes:
+        raise ValueError(f'Unknown shape: {shape}')
+    return shapes[shape]
+
+
+def add_shape(body):
+    """Create (or reuse) a geometric shape motif and append it to the motif list."""
+    if not STATE['folder']:
+        raise ValueError('Load a motif folder first.')
+    shape = body.get('shape', 'circle')
+    color = pc.normalize_color(body.get('color') or '') or '#333333'
+    outline = body.get('style') == 'outline'
+    width = max(1, min(20, int(body.get('stroke', 6))))
+    element, stroke_only = shape_geometry(shape)
+    if stroke_only or outline:
+        paint = f'fill="none" stroke="{color}" stroke-width="{width}" stroke-linejoin="round"'
+        style = f'outline{width}'
+    else:
+        paint = f'fill="{color}"'
+        style = 'fill'
+    name = f'shape_{shape}_{style}_{color[1:]}'
+    for m in STATE['motifs']:
+        if m.name == name:
+            return {'motif': motif_info(m)}
+    pad = width if (stroke_only or outline) else 0   # keep strokes inside the box
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{-pad} {-pad} {100 + 2 * pad} '
+           f'{100 + 2 * pad}" width="{100 + 2 * pad}" height="{100 + 2 * pad}">'
+           f'<g {paint}>{element}</g></svg>')
+    pc.ensure_dir(SHAPE_DIR)
+    path = SHAPE_DIR / f'{name}.svg'
+    path.write_text(svg, encoding='utf-8')
+    motif = pc.load_motif(path, len(STATE['motifs']), False)
+    motif.path = path
+    motif.role = 'filler'
+    motif.upright = shape in ('triangle', 'heart', 'half', 'drop', 'arc', 'chevron', 'wave')
+    STATE['motifs'].append(motif)
+    return {'motif': motif_info(motif)}
+
+
 def list_palettes():
     result = []
     if PALETTE_DIR.is_dir():
@@ -463,6 +552,7 @@ class Handler(BaseHTTPRequestHandler):
         actions = {'/api/load': load_folder, '/api/markup': markup, '/api/fill': fill,
                    '/api/colors': colors, '/api/colorways': colorways,
                    '/api/extract': extract_palette, '/api/save_palette': save_palette,
+                   '/api/shape': add_shape,
                    '/api/auto': auto, '/api/save': save, '/api/save_scheme': save_scheme}
         if self.path not in actions:
             return self.send(404, {'error': 'unknown action'})
@@ -527,6 +617,9 @@ textarea{width:100%;height:70px;font:12px monospace;border:1px solid var(--line)
 #cwGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:10px}
 .cw .tile{height:240px;border-radius:6px;background-repeat:repeat;background-size:120px 120px;border:1px solid var(--line)}
 #ed.gray{filter:grayscale(1)}
+.shapegrid{display:grid;grid-template-columns:repeat(8,1fr);gap:4px}
+.shapegrid button{padding:3px;aspect-ratio:1;display:flex;align-items:center;justify-content:center}
+.shapegrid svg{width:100%;height:100%}
 .layer{display:flex;align-items:center;gap:4px;padding:3px 4px;border:1px solid var(--line);border-radius:6px;margin:3px 0;cursor:pointer;font-size:12px}
 .layer.on{border-color:var(--accent);background:#eef6f3}
 .layer input[type=text]{flex:1;padding:3px 5px;font-size:12px}
@@ -562,6 +655,13 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
   <div class="muted" style="margin-top:6px">Colour map - original &rarr; now (click to change):</div>
   <div id="colorMap" class="row" style="gap:0"></div>
   <div class="row" style="margin-top:6px;flex-wrap:nowrap"><input type="text" id="palName" placeholder="palette name"><button id="palSave">Save palette</button></div>
+
+  <h2>Shapes <span class="muted" style="text-transform:none;letter-spacing:0">click a shape to add it</span></h2>
+  <div id="shapeStyle" class="tabs"></div>
+  <div class="row" style="margin-top:4px"><span class="muted">Colour</span><input type="color" id="shapeColor" value="#2e1c2b">
+    <span class="muted">Line</span><input type="range" id="shapeStroke" min="1" max="20" step="1" value="6" style="width:80px"><span id="v_shapeStroke" class="muted">6</span></div>
+  <label class="s">Size<span class="v" id="v_shapeSize">0.08</span><input type="range" id="shapeSize" min="0.01" max="0.6" step="0.005" value="0.08"></label>
+  <div id="shapeGrid" class="shapegrid"></div>
 
   <h2>Motifs <span class="muted" style="text-transform:none;letter-spacing:0">click a picture to add it</span></h2>
   <div id="groupTabs" class="tabs"></div>
@@ -849,9 +949,9 @@ function applyScheme(){
   sel=-1; autoSel=null; render(); renderStrip();
   status(`Scheme "${scheme}" applied: ${P.length} motifs. Drag, rotate (wheel) or scale (Shift+wheel) to adjust.`);
 }
-function addMotif(id){
+function addMotif(id,size){
   const m=byId(id); if(!m) return; snapshot();
-  P.push({id,x:block.on?0:T/2,y:block.on?0:T/2,s:roleSize(m.role==='off'?'medium':m.role),angle:block.on?0:angleFor(m,0),flip:1});
+  P.push({id,x:block.on?0:T/2,y:block.on?0:T/2,s:size||roleSize(m.role==='off'?'medium':m.role),angle:block.on?0:angleFor(m,0),flip:1});
   sel=P.length-1; render();
 }
 
@@ -1197,6 +1297,40 @@ $('bMirror').onchange=()=>{snapshot();block.mirror=$('bMirror').checked;render()
 ['bNc','bNr'].forEach(id=>$(id).oninput=e=>{snapshot();block[id==='bNc'?'nc':'nr']=+e.target.value;fixLattice();syncBlockUi();render()});
 $('bK').oninput=e=>{block.k=+e.target.value;$('v_bK').textContent=block.k.toFixed(2);render()};
 syncBlockUi();
+
+/* ---------- shapes ---------- */
+const SHAPES={circle:'<circle cx="50" cy="50" r="42"/>',square:'<rect x="10" y="10" width="80" height="80"/>',
+  rounded:'<rect x="10" y="10" width="80" height="80" rx="18"/>',triangle:'<polygon points="50,8 92,88 8,88"/>',
+  diamond:'<polygon points="50,6 88,50 50,94 12,50"/>',hexagon:'<polygon points="50,6 88,28 88,72 50,94 12,72 12,28"/>',
+  star:'<polygon points="50,5 61,38 96,38 68,58 79,92 50,72 21,92 32,58 4,38 39,38"/>',
+  burst:'<polygon points="50,4 58,22 76,12 74,32 94,34 80,48 94,64 74,66 76,88 58,78 50,96 42,78 24,88 26,66 6,64 20,48 6,34 26,32 24,12 42,22"/>',
+  heart:'<path d="M50 86 C22 66 8 50 8 33 C8 19 19 10 31 10 C40 10 47 16 50 23 C53 16 60 10 69 10 C81 10 92 19 92 33 C92 50 78 66 50 86 Z"/>',
+  half:'<path d="M8 68 A42 42 0 0 1 92 68 Z"/>',drop:'<path d="M50 6 C65 30 80 46 80 62 C80 79 67 92 50 92 C33 92 20 79 20 62 C20 46 35 30 50 6 Z"/>',
+  plus:'<polygon points="39,8 61,8 61,39 92,39 92,61 61,61 61,92 39,92 39,61 8,61 8,39 39,39"/>',
+  line:'<line x1="8" y1="50" x2="92" y2="50"/>',wave:'<path d="M6 50 C18 30 30 30 42 50 S66 70 78 50 S92 36 94 42"/>',
+  arc:'<path d="M12 70 A40 40 0 0 1 88 70"/>',chevron:'<polyline points="10,32 50,70 90,32"/>'};
+const STROKE_ONLY=['line','wave','arc','chevron'];
+let shapeStyle='fill';
+function renderShapes(){
+  $('shapeStyle').innerHTML=[['fill','Filled'],['outline','Outline']].map(([k,l])=>`<button class="${k===shapeStyle?'on':''}" data-st="${k}">${l}</button>`).join('');
+  $('shapeStyle').querySelectorAll('button').forEach(b=>b.onclick=()=>{shapeStyle=b.dataset.st;renderShapes()});
+  const c=$('shapeColor').value;
+  $('shapeGrid').innerHTML=Object.entries(SHAPES).map(([k,el])=>{const line=STROKE_ONLY.includes(k)||shapeStyle==='outline';
+    return `<button data-shape="${k}" title="${k}"><svg viewBox="0 0 100 100"><g ${line?`fill="none" stroke="${c}" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"`:`fill="${c}"`}>${el}</g></svg></button>`}).join('');
+  $('shapeGrid').querySelectorAll('button').forEach(b=>b.onclick=()=>addShape(b.dataset.shape));
+}
+async function addShape(shape){
+  if(!motifs.length){status('Load a motif folder first.');return}
+  try{const j=await api('/api/shape',{shape,style:shapeStyle,color:$('shapeColor').value,stroke:+$('shapeStroke').value});
+    if(!byId(j.motif.id)){motifs.push(j.motif);renderMotifs();await loadMarkup()}
+    addMotif(j.motif.id,+$('shapeSize').value); P[sel].angle=0; P[sel].flip=1; render();   // shapes start straight
+    status(`Added ${shape}. Drag to move, wheel to rotate, Shift+wheel to resize. It is a filler in the motif list - change its role there.`);
+  }catch(e){status(e.message)}
+}
+$('shapeColor').oninput=renderShapes;
+$('shapeStroke').oninput=e=>$('v_shapeStroke').textContent=e.target.value;
+$('shapeSize').oninput=e=>$('v_shapeSize').textContent=e.target.value;
+renderShapes();
 
 /* ---------- wiring ---------- */
 document.querySelectorAll('[data-layer]').forEach(b=>b.onclick=()=>layerAct(b.dataset.layer));
