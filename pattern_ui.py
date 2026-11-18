@@ -5,7 +5,8 @@ Pattern UI - local web editor for seamless vector patterns (PatternComposer).
 Load a folder of SVG motifs, pick a layout scheme (half-drop, brick, diamond,
 bouquets, vine, ditsy, toss, your own saved schemes, or scored auto layouts),
 then move, rotate, scale, flip, swap, add and delete motifs by hand on a live
-wrap-around tile. Shapes: circles, squares, triangles, stars, hearts, lines,
+wrap-around tile, drawn on the GPU (WebGL2) with fast preview on, as plain SVG
+otherwise. Shapes: circles, squares, triangles, stars, hearts, lines,
 waves and more, filled or outlined, any colour, added as motifs. Layers: each layer has its own motifs and its own free or
 block mode (e.g. a ditsy background layer under half-drop bouquets); show, lock,
 reorder, merge; saved SVGs keep one group per layer. Colour: built-in and saved palettes, palettes from an image,
@@ -666,7 +667,8 @@ label.s input{grid-column:1/3;width:100%}
 .bar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
 .muted{color:var(--muted);font-size:12px}
 #edBox{position:relative;overflow:hidden;background:#ddd}
-#ed{width:100%;height:100%;display:block;touch-action:none}
+#ed{width:100%;height:100%;display:block;touch-action:none;position:relative}
+#glc{position:absolute;inset:0;width:100%;height:100%;display:none}
 #ed use{cursor:grab}
 .strip{display:flex;gap:8px;overflow-x:auto;padding:8px 12px;background:var(--panel);border-top:1px solid var(--line)}
 .strip:empty{display:none}
@@ -788,7 +790,7 @@ summary{cursor:pointer;color:var(--muted);font-size:12px}
     <label class="muted"><input type="checkbox" id="fade" checked> fade repeats</label>
     <label class="muted" title="Draw motifs as pictures while editing - much faster for detailed motifs; saved files stay vector"><input type="checkbox" id="fast" checked> fast preview</label>
   </div>
-  <div id="edBox"><svg id="ed" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <div id="edBox"><canvas id="glc"></canvas><svg id="ed" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
     <defs id="mdefs"></defs>
     <rect id="bgRect" x="-1000" y="-1000" width="3000" height="3000" fill="#f6f1e7"/>
     <g id="refLayer"></g><g id="inst"></g>
@@ -978,6 +980,7 @@ async function loadMarkup(){
       return `<g id="m${m.id}"><image href="data:image/png;base64,${m.png}" x="${d.cx-d.w/2}" y="${d.cy-d.h/2}" width="${d.w}" height="${d.h}" preserveAspectRatio="none"/></g>`}
     return `${m.defs}<g id="m${m.id}">${m.body}</g>`}).join('');
   layerCache=[];
+  await GL.setMotifs(j.motifs, j.bg);
   $('bgRect').setAttribute('fill',j.bg); if(!$('customBg').checked) $('bgColor').value=toHex(j.bg);
   renderColorMap(j.colors); renderCurPal(); render(); renderStrip();
 }
@@ -1060,6 +1063,15 @@ function renderNow(){
   const ctx=parseFloat($('ctx').value)*T;
   $('ed').setAttribute('viewBox',`${-ctx} ${-ctx} ${T+2*ctx} ${T+2*ctx}`);
   commit();
+  const gpu=GL.active();
+  $('glc').style.display=gpu?'block':'none';
+  for(const id of ['bgRect','refLayer','inst']) $(id).style.display=gpu?'none':'';
+  if(gpu){GL.draw(ctx); layerCache=[]; $('inst').innerHTML='';
+    const big=`M${-T} ${-T}H${2*T}V${2*T}H${-T}Z`, hole=`M0 0V${T}H${T}V0Z`;
+    $('fadeMask').setAttribute('d',big+hole); $('fadeMask').style.display=$('fade').checked?'':'none';
+    if($('layerList')) for(const el of $('layerList').querySelectorAll('.layer .muted')){const i=+el.parentElement.dataset.l;
+      el.innerHTML=layers[i].P.length+(layers[i].block.on?' &#9638;':'')}
+    renderSel(); return}
   const dim=$('dimLayers').checked, inst=$('inst');
   while(inst.children.length<layers.length) inst.appendChild(document.createElementNS('http://www.w3.org/2000/svg','g'));
   while(inst.children.length>layers.length) inst.lastChild.remove();
@@ -1090,7 +1102,7 @@ function renderSel(){
     fill="none" stroke="#1a73e8" stroke-width="2" vector-effect="non-scaling-stroke" stroke-dasharray="${(dx||dy||n)?'4 4':'none'}"/></g>`).join('')).join('');
   $('selInfo').textContent=`${m.name} · size ${p.s.toFixed(3)} · ${Math.round(p.angle)}°`;
 }
-function renderRef(){
+function renderRef(){ if(GL.active()) return GL.setRef(refImg).then(render);
   if(!refImg){$('refLayer').innerHTML='';return}
   const op=$('refOp').value, offs=$('refRepeat').checked?OFFS:[[0,0]];
   $('refLayer').innerHTML=offs.map(([dx,dy])=>`<image href="${refImg}" x="${dx}" y="${dy}" width="${T}" height="${T}" preserveAspectRatio="none" opacity="${op}" pointer-events="none"/>`).join('');
@@ -1100,10 +1112,12 @@ function renderRef(){
 function svgPoint(e){const svg=$('ed'),pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;return pt.matrixTransform(svg.getScreenCTM().inverse())}
 let drag=null;
 $('ed').addEventListener('pointerdown',e=>{
-  const i=e.target.dataset?e.target.dataset.i:undefined;
+  const pt=svgPoint(e);
+  let i=e.target.dataset?e.target.dataset.i:undefined, mir=e.target.dataset?e.target.dataset.m==='1':false;
+  if(GL.active()){const h=GL.pick(pt.x,pt.y);i=h?h.src:undefined;mir=h?h.m:false}
   if(i===undefined){sel=-1;renderSel();return}
-  sel=+i; const pt=svgPoint(e); snapshot();
-  const k=block.on?block.k:1, sx=e.target.dataset.m==='1'?-1:1;
+  sel=+i; snapshot();
+  const k=block.on?block.k:1, sx=mir?-1:1;
   drag={x0:pt.x,y0:pt.y,px:P[sel].x,py:P[sel].y,moved:false,k,sx};
   $('ed').setPointerCapture(e.pointerId); render();
 });
@@ -1404,6 +1418,137 @@ $('bMirror').onchange=()=>{snapshot();block.mirror=$('bMirror').checked;render()
 ['bNc','bNr'].forEach(id=>$(id).oninput=e=>{snapshot();block[id==='bNc'?'nc':'nr']=+e.target.value;fixLattice();syncBlockUi();render()});
 $('bK').oninput=e=>{block.k=+e.target.value;$('v_bK').textContent=block.k.toFixed(2);render()};
 syncBlockUi();
+
+/* ---------- GPU canvas (WebGL2) ----------
+   Every motif is a picture in one texture atlas; all copies of all layers are drawn
+   with a single instanced draw call per frame. The SVG on top keeps only the frame,
+   guides, fade and selection. Falls back to plain SVG when WebGL2 is missing or
+   "fast preview" is off. */
+const GL=(()=>{
+  const cv=$('glc'); let gl=null, prog, vao, instBuf, atlasTex=null, refTex=null, ok=false;
+  let uv={}, alpha={}, bg=[0.96,0.94,0.9], refSize=null, inst=new Float32Array(0);
+  const VS=`#version 300 es
+  layout(location=0) in vec2 q; layout(location=1) in vec4 m1; layout(location=2) in vec2 m2;
+  layout(location=3) in vec4 uvr; layout(location=4) in float al;
+  uniform vec4 view; out vec2 tc; out float a;
+  void main(){ vec2 w=vec2(m1.x*q.x+m1.z*q.y+m2.x, m1.y*q.x+m1.w*q.y+m2.y);
+    vec2 n=(w-view.xy)*view.zw; gl_Position=vec4(n.x*2.0-1.0, 1.0-n.y*2.0, 0, 1);
+    tc=mix(uvr.xy,uvr.zw,q); a=al; }`;
+  const FS=`#version 300 es
+  precision mediump float; in vec2 tc; in float a; uniform sampler2D tex; out vec4 o;
+  void main(){ o=texture(tex,tc)*a; }`;
+  function init(){
+    if(gl) return !!prog;
+    gl=cv.getContext('webgl2',{premultipliedAlpha:true,antialias:true});
+    if(!gl) return false;
+    const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);return s};
+    prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+    gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)){prog=null;return false}
+    vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+    const qb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,qb);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,0,1,0,0,1,1,1]),gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    instBuf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,instBuf);
+    const S=11*4; [[1,4,0],[2,2,16],[3,4,24],[4,1,40]].forEach(([loc,n,off])=>{
+      gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,n,gl.FLOAT,false,S,off); gl.vertexAttribDivisor(loc,1)});
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    return true;
+  }
+  const loadImg=src=>new Promise(r=>{const im=new Image();im.onload=()=>r(im);im.onerror=()=>r(null);im.src=src});
+  function texFrom(source){
+    const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    for(const p of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,p,gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  async function setMotifs(list,bgHex){
+    ok=false; bg=hexRgb(bgHex);
+    if(!list.length||list.some(m=>!m.png)||!init()) return;
+    const imgs=await Promise.all(list.map(m=>loadImg('data:image/png;base64,'+m.png)));
+    if(imgs.some(x=>!x)) return;
+    // shelf packing into one atlas; shrink the cells if the motifs do not fit
+    const max=Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE),8192);
+    let cell=Math.min(480,Math.floor(max/Math.ceil(Math.sqrt(imgs.length))));
+    let place;
+    for(;cell>=32;cell=Math.floor(cell*0.85)){
+      place=[];let x=1,y=1,row=0,fits=true;
+      for(const im of imgs){const k=cell/Math.max(im.width,im.height),w=Math.max(1,Math.round(im.width*k)),h=Math.max(1,Math.round(im.height*k));
+        if(x+w+1>max){x=1;y+=row+2;row=0} if(y+h+1>max){fits=false;break}
+        place.push([x,y,w,h]);x+=w+2;row=Math.max(row,h)}
+      if(fits) break;
+    }
+    const W=max, H=Math.min(max,Math.max(...place.map(p=>p[1]+p[3]))+2);
+    const c=document.createElement('canvas');c.width=W;c.height=H;const g=c.getContext('2d');
+    uv={};alpha={};
+    list.forEach((m,i)=>{const [x,y,w,h]=place[i];g.drawImage(imgs[i],x,y,w,h);
+      uv[m.id]=[(x+0.5)/W,(y+0.5)/H,(x+w-0.5)/W,(y+h-0.5)/H];
+      const a=document.createElement('canvas');a.width=64;a.height=64;const ag=a.getContext('2d');   // small alpha map for picking
+      ag.drawImage(imgs[i],0,0,64,64);alpha[m.id]=ag.getImageData(0,0,64,64).data;});
+    if(atlasTex) gl.deleteTexture(atlasTex);
+    atlasTex=texFrom(c); ok=true; refSrc=null; refTex=null;
+    if(refImg) await setRef(refImg);
+  }
+  let refSrc=null;
+  async function setRef(src){
+    if(!gl||!ok||src===refSrc) return;
+    refSrc=src;
+    if(refTex){gl.deleteTexture(refTex);refTex=null}
+    if(!src) return;
+    const im=await loadImg(src); if(im){refTex=texFrom(im);refSize=[im.width,im.height]}
+  }
+  const hexRgb=h=>{h=/^#[0-9a-f]{6}$/i.test(h||'')?h:'#f6f1e7';return [1,3,5].map(i=>parseInt(h.slice(i,i+2),16)/255)};
+  // affine of one copy, mapped onto the unit quad of its picture
+  function quad(p,dx,dy){
+    const m=byId(p.id),k=p.s*T/Math.max(m.w,m.h),r=p.angle*Math.PI/180,co=Math.cos(r),si=Math.sin(r);
+    const a=co*k*p.flip,b=si*k*p.flip,c=-si*k,d=co*k,e=p.x+dx-(a*m.cx+c*m.cy),f=p.y+dy-(b*m.cx+d*m.cy);
+    const x0=m.cx-m.w/2,y0=m.cy-m.h/2;
+    return [a*m.w,b*m.w,c*m.h,d*m.h,a*x0+c*y0+e,b*x0+d*y0+f];
+  }
+  let lastActive=[];
+  function draw(ctx){
+    const box=$('edBox'),dpr=window.devicePixelRatio||1,W=box.clientWidth,H=box.clientHeight;
+    if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr)}
+    const span=T+2*ctx,sc=Math.min(W,H)/span,vx=-ctx-(W/sc-span)/2,vy=-ctx-(H/sc-span)/2;
+    gl.viewport(0,0,cv.width,cv.height); gl.clearColor(...hexRgb($('bgRect').getAttribute('fill')),1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog); gl.bindVertexArray(vao);
+    gl.uniform4f(gl.getUniformLocation(prog,'view'),vx,vy,sc/W,sc/H);
+    const vis=(x,y,r)=>x+r>-ctx&&x-r<T+ctx&&y+r>-ctx&&y-r<T+ctx;
+    if(refTex){   // reference tile underneath, repeated like the motifs
+      const op=+$('refOp').value,offs=$('refRepeat').checked?OFFS:[[0,0]],buf=[];
+      for(const [dx,dy] of offs) buf.push(T,0,0,T,dx,dy,0,0,1,1,op);
+      drawBuf(new Float32Array(buf),refTex);
+    }
+    const dim=$('dimLayers').checked,out=[]; lastActive=[];
+    layers.forEach((l,li)=>{ if(!l.visible) return;
+      const op=dim&&li!==L?0.35:1, live=li===L&&!l.locked;
+      for(const d of drawList(l)){const p=d.e.p;
+        if(!vis(p.x+d.dx,p.y+d.dy,p.s*T*0.75)||!uv[p.id]) continue;
+        const q=quad(p,d.dx,d.dy); out.push(...q,...uv[p.id],op);
+        if(live) lastActive.push({q,id:p.id,src:d.e.src,m:d.e.m});}
+    });
+    drawBuf(new Float32Array(out),atlasTex);
+  }
+  function drawBuf(arr,tex){
+    if(!arr.length) return;
+    gl.bindTexture(gl.TEXTURE_2D,tex); gl.bindBuffer(gl.ARRAY_BUFFER,instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER,arr,gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,arr.length/11);
+  }
+  function pick(x,y){   // topmost copy of the active layer whose picture is not transparent at (x, y)
+    for(let i=lastActive.length-1;i>=0;i--){const {q,id,src,m}=lastActive[i];
+      const det=q[0]*q[3]-q[2]*q[1]; if(Math.abs(det)<1e-9) continue;
+      const px=x-q[4],py=y-q[5],u=(q[3]*px-q[2]*py)/det,v=(-q[1]*px+q[0]*py)/det;
+      if(u<0||v<0||u>1||v>1) continue;
+      const a=alpha[id]; if(a&&a[(Math.min(63,Math.floor(v*64))*64+Math.min(63,Math.floor(u*64)))*4+3]<24) continue;
+      return {src,m};}
+    return null;
+  }
+  return {setMotifs,setRef,draw,pick,active:()=>ok&&$('fast').checked};
+})();
 
 /* ---------- shapes ---------- */
 const SHAPES={circle:'<circle cx="50" cy="50" r="42"/>',square:'<rect x="10" y="10" width="80" height="80"/>',
